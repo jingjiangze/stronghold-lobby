@@ -48,7 +48,7 @@ tools/apk/lobby-worker/
 | 方法 | 路径 | 请求 | 成功 | 说明 |
 | --- | --- | --- | --- | --- |
 | GET | `/` `/index.html` | — | `200 text/html` | **前台网页**（见下节）；`cache-control: public, max-age=60`；非 GET/HEAD → 405；纯静态，不碰 DO |
-| GET | `/api/rooms` | 可选头 `X-Device`（设备号） | `200 {ok,now,ttlSec,visitors,rooms[]}` | `now` 为 epoch 毫秒；只含未过期条目，最新在前。**v5.2**：同一次请求顺带记一个大厅访客（`X-Device` 优先、IP 兜底），`visitors` = 120s 窗口内去重访客数——零额外请求 |
+| GET | `/api/rooms` | 可选头 `X-Device`（设备号） | `200 {ok,now,ttlSec,visitors,rooms[]}` | `now` 为 epoch 毫秒；只含未过期条目，最新在前。**v5.2**：同一次请求顺带记一个大厅访客（`X-Device` 优先、IP 兜底），`visitors` = 120s 窗口内去重访客数——零额外请求。**v5.6**：访客心跳写节流（`VISIT_WRITE_MIN_MS` 60s，同 key 60s 内只落一行；DO 行写免费额度 10 万/天） |
 | POST | `/api/rooms` | JSON `{code, serverId, serverName, note?, url?, difficulty?, mode?, status?, occupied?, capacity?}` | `201 {ok:true, added, token}` | `token` = 128bit hex（32 字符），请客户端保存；**v5.2 直播字段**白名单化（非法值忽略，绝不因此拒绝提交） |
 | PATCH | `/api/rooms` | JSON `{code, serverId, note, mode?, status?, occupied?, capacity?}`，头 `X-Token: <token>` | `200 {ok:true, updated:{code,serverId,note,+直播字段}}` | 仅 token+serverId **完全匹配**才可编辑；`note` 缺省/空白 = 清空；**v5.2** 起可同时刷新直播字段（只覆盖本次带上者），`createdAt`/`url`/`token` 不动，**不刷新 TTL**、不新增限流桶 |
 | DELETE | `/api/rooms?code=&serverId=` | 头 `X-Token: <token>` | `200 {ok:true, removed:{code,serverId}}` | 仅凭 token+serverId 匹配才可销毁 |
@@ -65,7 +65,7 @@ tools/apk/lobby-worker/
 `https://sp-lobby.jiangjiangze.icu/` 直接打开的公开页面（`src/page.js`：单文件 HTML/CSS/JS、零外链、自带 CSP）：**最新的可加入房间排在最前，点一下就进场**；自己开了房也能在页面上直接**提交房间**。
 
 - 外观与下载站（`dl.jiangjiangze.icu`）同一套视觉语言：同一色板 / Novecento Wide + Bender（`tools/embed-fonts.mjs` 以 base64 内嵌，零外链）、标题屏的辉光-雷达-山脊背景与四角状态栏、方角面板与悬停四角括号的按钮；窄屏/竖屏单独抬根字号。
-- **数据来源 = 四源聚合，逐行标注来源**：本站房间牌（同源 `GET /api/rooms`，20 s 轮询）+ 三个社区站（`GET /api/community?src=rainya|lunar|rinko`，180 s 拉一次——中转本身 10 s 边缘缓存、上游有额度）。每间房的行上带「来源」标签：本站写「本站」，社区行直接写网站域名并链接到对应站点（`game.rainya.me` / `stronghold.lunar.ag` / `卫.rinko.ai`）；页脚另有「数据来源」标注写全四家（网站域名），某个源拉不通就地标「暂不可达」，绝不影响其它源。
+- **数据来源 = 四源聚合，逐行标注来源**：本站房间牌（同源 `GET /api/rooms`，30 s 轮询）+ 三个社区站（`GET /api/community?src=rainya|lunar|rinko`，180 s 拉一次——中转本身 10 s 边缘缓存、上游有额度）。**两个定时器在后台标签页都不发请求**（`visibilitychange` 回前台立刻全量刷新），配合服务端 60s 写节流：一个挂着不管的标签页不再烧 Workers/DO 免费额度。每间房的行上带「来源」标签：本站写「本站」，社区行直接写网站域名并链接到对应站点（`game.rainya.me` / `stronghold.lunar.ag` / `卫.rinko.ai`）；页脚另有「数据来源」标注写全四家（网站域名），某个源拉不通就地标「暂不可达」，绝不影响其它源。
 - 合并 / 去重规则与 APK 面板一致：本站优先，其次 rainya → lunar → rinko；去重键 = 主机（或 serverId / 服务器名）+ 房号（不同站的同号房间是两间房）。
 - 排序：**可加入（开放）永远在最前**，组内最新在前、无时间戳的常驻行排其后；`status=playing` 的行给「观战」按钮（目标带 `?spectate=1`），满员行置灰仍展示；
 - 「加入」目标 = 房间行自己的 `url`（https + 公网主机校验，与服务端 `board.js` deny 表逐条对齐；不合法回落官方网页入口 `https://weishu.jiangjiangze.icu/`），拼 `?room=CODE`——与客户端深链同一约定；

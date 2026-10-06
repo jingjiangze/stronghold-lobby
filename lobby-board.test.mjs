@@ -870,13 +870,41 @@ test('visitors: distinct device keys inside the 120s window, IP fallback, expiry
   const junk = await board.list(T0 + 4_000, { visitorKey: 'bad key!!', ip: '' });
   assert.equal(junk.visitors, 3, 'malformed visitor keys are ignored');
 
-  // dev-aaa was refreshed at T0+2s, so at T0+121s it is still inside its own 120s window
+  // v5.6 写节流：落盘时间最多滞后 60s —— dev-aaa 在 T0+2s 那次**不重写**（T0 才写过），
+  // 于是它的窗口仍从 T0 起算；8.8.8.8 在 T0+3s 落过盘，两者到 T0+121s 的状态就不同。
   const mid = await board.list(T0 + 121_000, { visitorKey: 'dev-new', ip: '' });
-  assert.equal(mid.visitors, 3, 'the window slides per key (dev-aaa@2s + 8.8.8.8@3s + dev-new)');
+  assert.equal(mid.visitors, 2, 'throttled dev-aaa (stored T0) expired; 8.8.8.8 (T0+3s) + dev-new live');
   const after = await board.list(T0 + 125_000, { visitorKey: 'dev-late', ip: '' });
-  assert.equal(after.visitors, 2, 'the two old keys have now expired; dev-new + dev-late remain');
+  assert.equal(after.visitors, 2, '8.8.8.8 expires at 122s; dev-new + dev-late remain');
   const much = await board.list(T0 + 130_000, { visitorKey: 'dev-later', ip: '' });
   assert.equal(much.visitors, 3, 'each key keeps its own expiry, the rest stay live');
+});
+
+test('visitors: 心跳写节流 —— 同一访客 60s 内只写一行（免费额度：行写 10 万/天）', async () => {
+  const state = memoryState();
+  let writes = 0;
+  const counting = {
+    get: (k) => state.get(k),
+    put: (k, v) => { writes += 1; return state.put(k, v); },
+    delete: (k) => state.delete(k),
+    list: () => state.list(),
+  };
+  const board = createBoard({ state: counting, now: () => T0 });
+
+  const first = await board.list(T0, { visitorKey: 'dev-aaa', ip: '' });
+  assert.equal(first.visitors, 1);
+  assert.equal(writes, 1, '首次轮询落一行');
+
+  await board.list(T0 + 20_000, { visitorKey: 'dev-aaa', ip: '' });
+  await board.list(T0 + 40_000, { visitorKey: 'dev-aaa', ip: '' });
+  assert.equal(writes, 1, '60s 内的后续轮询不再写（计数照旧由窗口内的 key 提供）');
+
+  const refreshed = await board.list(T0 + 60_000, { visitorKey: 'dev-aaa', ip: '' });
+  assert.equal(writes, 2, '落盘时间戳满 60s 才重写一行');
+  assert.equal(refreshed.visitors, 1, '节流不影响计数');
+
+  // 20s 节奏 1 小时 = 180 次轮询：原来 180 写，现在 ≤60 写。
+  assert.ok(writes <= 2, `180 次轮询量级下写量保持常数级（这里是 ${writes}）`);
 });
 
 test('live fields: add echoes mode/status/occupied/capacity (whitelisted), update patches only what is sent', async () => {

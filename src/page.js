@@ -11,11 +11,15 @@
 //   rainya — game.rainya.me        ┐
 //   lunar  — stronghold.lunar.ag   ├ read-only community stations, relayed by GET /api/community
 //   rinko  — 卫.rinko.ai (梨子湖)  ┘ (their upstreams send no CORS headers; the relay is the door)
-// The board polls every 20 s; the community relay is pulled every 180 s (it is edge-cached 10 s
-// and its upstreams are quota-limited). Rows carry a source tag so every room states where it
-// came from; joinable rooms get a 加入 button, in-match rooms get 观战. Outbound navigation is
-// limited to https URLs on public hosts (the same scheme/deny-table spirit as the server's
-// targetHostDenyReason), so a hostile card can never point the page at loopback/private space.
+// The board polls every 30 s; the community relay is pulled every 180 s (it is edge-cached 10 s
+// and its upstreams are quota-limited). Both timers stay silent while the tab is hidden — a page
+// parked in a background tab must not burn the Workers/DO free tier (see src/board.js
+// VISIT_WRITE_MIN_MS for the matching server-side write throttle). Rows carry a source tag so
+// every room states where it came from; joinable rooms get a 加入 button, in-match rooms get
+// 观战 (the client auto-spectates on `?room=CODE&spectate=1` — client patch v5.6). Outbound
+// navigation is limited to https URLs on public hosts (the same scheme/deny-table spirit as the
+// server's targetHostDenyReason), so a hostile card can never point the page at loopback/private
+// space.
 //
 // 提交房间 (v0.2): a visitor can publish their own room to the board (POST /api/rooms, the same
 // endpoint the app's panel uses) and, while its 10-minute TTL lasts, edit the note (PATCH) or
@@ -524,8 +528,10 @@ export const PAGE_HTML = `<!doctype html>
 <script>
 (function () {
   'use strict';
-  // 房间牌 20s 一跳（与旧版一致）；社区源 180s —— 中转本身有 10s 边缘缓存、上游有额度，别按房间牌的节奏拉。
-  var POLL_MS = 20000;
+  // 房间牌 30s 一跳；社区源 180s —— 中转本身有 10s 边缘缓存、上游有额度，别按房间牌的节奏拉。
+  // v5.6 额度纪律：**页面在后台标签页时两个定时器都不发请求**（回来时 visibilitychange 立刻全量刷新），
+  // 服务端的访客心跳也做了 60s 写节流 —— 一个挂着不管的标签页不再按整点烧 DO 的行写额度。
+  var POLL_MS = 30000;
   var COMMUNITY_POLL_MS = 180000;
   // 默认加入目标：官方网页入口（房间行未携带自己的 url、或提交时未填房间地址时使用）。
   var DEFAULT_CLIENT = 'https://weishu.jiangjiangze.icu/';
@@ -914,7 +920,9 @@ export const PAGE_HTML = `<!doctype html>
     return pull('board').then(function () { render(); });
   }
 
+  /** 社区源一跳（后台标签页直接跳过 —— 省额度，见顶部 POLL_MS 注释）。 */
   function loadCommunity() {
+    if (document.hidden) return Promise.resolve();
     return Promise.all(['rainya', 'lunar', 'rinko'].map(pull)).then(function () { render(); });
   }
 
@@ -1095,6 +1103,7 @@ export const PAGE_HTML = `<!doctype html>
   }
 
   function tick() {
+    if (document.hidden) { cdEl.textContent = ''; return; }   // 后台不发请求，倒计时也不显示
     var left = Math.max(0, Math.ceil((nextAt - Date.now()) / 1000));
     cdEl.textContent = left > 0 ? left + 's 后刷新' : '';
   }
@@ -1104,13 +1113,14 @@ export const PAGE_HTML = `<!doctype html>
     statusEl.textContent = '连接大厅失败';
     if (!list.querySelector('.room')) {
       list.innerHTML = '<div class="lobby-state"><b>暂时连不上大厅服务</b>' + esc(String((err && err.message) || err))
-        + '<br /><br />将在 20 秒后自动重试。</div>';
+        + '<br /><br />将在 ' + Math.round(POLL_MS / 1000) + ' 秒后自动重试。</div>';
     }
   }
 
-  /** 房间牌一跳（下一跳倒计时从它算起）；初始化与轮询都走这里。 */
+  /** 房间牌一跳（下一跳倒计时从它算起）；初始化与轮询都走这里。后台标签页跳过不发请求。 */
   function cycle() {
     nextAt = Date.now() + POLL_MS;
+    if (document.hidden) return Promise.resolve();
     return loadBoard().catch(fail);
   }
 
