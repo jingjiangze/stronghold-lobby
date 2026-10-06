@@ -275,6 +275,18 @@ test('page: 后台标签页不发任何请求，回到前台立刻全量刷新�
   assert.match(els.list.innerHTML, /KKKK/, "community rows come along on the refresh");
 });
 
+test('page: 轮询节奏守住额度下限（房间牌 60s、社区源 300s，与 APK 面板同档）', async () => {
+  const { api } = await runPage({ ok: true, now: NOW, rooms: [] });
+  // 免费额度账：Workers/DO 各 10 万请求/天，而这页每跳要 1 次房间牌 + 3 次社区中转。
+  // 60s/300s 下一个**可见**标签页 = 96 请求/小时（后台标签页 0）；再快就是拿额度换几秒钟的新鲜度。
+  // 这个用例是「别偷偷调回 20s」的闸门：改档要同时改这里与 README，并说明理由。
+  assert.ok(api.pollMs >= 60000, `board poll must stay >= 60s (got ${api.pollMs})`);
+  assert.ok(api.communityPollMs >= 300000, `relay poll must stay >= 300s (got ${api.communityPollMs})`);
+  // 与客户端面板同一档：extras/public/js/lobby.js 的 BOARD_REFRESH_MS=60000 / COMMUNITY_REFRESH_MS=300000
+  assert.equal(api.pollMs, 60000);
+  assert.equal(api.communityPollMs, 300000);
+});
+
 test('page: empty board and offline state render explicit guidance', async () => {
   const empty = await runPage({ ok: true, now: 0, ttlSec: 600, visitors: 0, rooms: [] });
   assert.match(empty.list.innerHTML, /现在没有公开的房间/);
