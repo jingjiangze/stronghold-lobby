@@ -31,11 +31,12 @@ tools/apk/lobby-worker/
 ├── src/board.js            # 房间牌纯核心：校验 / 限流 / TTL / token（零依赖，node --test 直测）
 ├── src/match.js            # 跨服匹配队列纯核心：入队 / 成队 / 房号交接 / 取消（同风格零依赖）
 ├── src/index.js            # Worker 路由 + 两个 DO 类 Board / MatchQueue（薄适配层 + 粗粒度 alarm）
-├── src/page.js             # 前台网页（GET / 的整页 HTML/CSS/JS：实时房间牌 + 加入/观战，单文件零外链）
+├── src/page.js             # 前台网页（GET / 的整页 HTML/CSS/JS：实时房间牌 + 加入/观战 + 提交房间，单文件零外链）
 ├── wrangler.toml           # name / DO 绑定 ×2 / migrations v1+v2（部署命令见文件注释）
 ├── lobby-board.test.mjs    # node --test（内存适配器直测核心 + 适配层往返 + GET / 静态页）
 ├── lobby-relay.test.mjs    # node --test（社区源中转：白名单/映射/超时/缓存头，脚本化上游）
 ├── match-queue.test.mjs    # node --test（队列：成队/房主选举/房号交接/取消/TTL/限流/上限）
+├── page.test.mjs           # node --test（前台网页内联脚本：渲染/排序/转义 + 提交房间表单与三个房间牌动作）
 └── README.md               # 本文件
 ```
 
@@ -60,13 +61,20 @@ tools/apk/lobby-worker/
 
 ## 前台网页（`GET /`）
 
-`https://sp-lobby.jiangjiangze.icu/` 直接打开的公开页面（`src/page.js`：单文件 HTML/CSS/JS、零外链、自带 CSP）：只做一件事——**最新的可加入房间排在最前，点一下就进场**。
+`https://sp-lobby.jiangjiangze.icu/` 直接打开的公开页面（`src/page.js`：单文件 HTML/CSS/JS、零外链、自带 CSP）：**最新的可加入房间排在最前，点一下就进场**；自己开了房也能在页面上直接**提交房间**。
 
 - 数据 = 同源 `GET /api/rooms`，20 s 轮询 + 切回标签页立即刷新；页面不直连任何第三方；
 - 排序：**可加入（开放）永远在最前**，组内最新在前；`status=playing` 的行给「观战」按钮（目标带 `?spectate=1`），满员行置灰仍展示；
 - 「加入」目标 = 卡片自己的 `url`（https + 公网主机校验，与服务端 `board.js` deny 表逐条对齐；不合法回落官方网页入口 `https://weishu.jiangjiangze.icu/`），拼 `?room=CODE`——与客户端深链同一约定；
 - 难度中文名 `标准/险境/绝境/终极`（与 APK 面板 `MATCH_DIFFS` 同表）；服务器名原样展示（不隐藏）；房间列表可滚动；
-- 页面是**被动只读视图**：只有 `GET /api/rooms` 一种请求，没有提交/编辑入口，不接受任何输入。
+- **提交房间**（默认折叠，页头「＋ 提交房间」展开）：房号 + 服务器名 + 选填难度/备注/房间地址 → 同源 `POST /api/rooms`；
+  - 房号输入即归一（大写、只留 `[A-HJ-NP-Z]`、≤4 位）；服务器名候选 = 当前房间牌里出现过的服务器（`<datalist>`，同一台服务器的房间共享主机），也可手填；
+  - 服务器名命中候选时用房间牌里那台服务器的 `serverId`，并把它的主机自动填进「房间地址」（手工改过就不再覆盖）；否则 `serverId = serverName`；
+  - 「房间地址」选填，必须 https 公网主机（与「加入」同一张 deny 表）——填了「加入」才会跳到那台服务器，留空则回落官方网页入口；
+  - 提交成功后 token 只存本源 `localStorage['sp.lobby.mine']`（`code → {token, serverId, serverName, expiresAt}`）；此后这张卡片带「我的」徽标、剩余时间，以及「改备注」（PATCH）与「销毁」（DELETE）按钮——APK 面板同一套房间牌动作，页面侧**零服务端改动**（三条路由与 CORS 早已就绪）；
+  - 服务端约束照旧生效：同 IP ≤5 条未过期、10 次/60 s、同房号 30 s 防抖、TTL 600 s、保留字（`sp-phone-host`/`local`/`auto`）与私网地址拒绝；错误码在页面本地翻译成中文提示（`DEBOUNCED` → 「30 秒后再试」等）；
+  - token 是唯一凭据（服务端 PATCH/DELETE 要求 token + serverId 双匹配）；显示层从不把它发给第三方，只交回房间牌。
+- 页面只请求同源 `/api/rooms`（GET/POST/PATCH/DELETE），不加载任何外部资源，CSP 保持 `connect-src 'self'`。
 
 房间条目（`rooms[i]` / `added`）：
 
@@ -139,13 +147,15 @@ url 的 host 拒绝表与 `tools/apk/overlay/sp-connect.mjs`（shell 出站守�
 ## 测试与自检
 
 ```bash
-node --check tools/apk/lobby-worker/src/board.js
-node --check tools/apk/lobby-worker/src/index.js
-node --test tools/apk/lobby-worker/lobby-board.test.mjs
-node --test tools/apk/lobby-worker/match-queue.test.mjs
+node --check src/board.js
+node --check src/index.js
+node --check src/page.js
+node --test        # 全仓（board / relay / match / page）
 ```
 
 测试用内存适配器直测核心，并断言**全局 fetch 调用数为 0**（房间牌路由零出站；社区源中转走 lobby-relay.test.mjs 单独验证，仅允许三个常量上游）。覆盖：契约形状与 rainya 兼容字段、TTL/leftSec/过期清理、限流三条（IP 频次 / code 防抖 / IP 条目上限）、token 销毁（成功 / 错误 token / 不存在）、note 清洗与长度、备注编辑 PATCH（成功改备注 / 错误 token / 错误 serverId / 不存在或过期 / 不刷新 TTL / 其它字段不动）、保留字拦截（`sp-phone-host` / `local` / `auto`，含大小写与 trim 变体；相似 id 回归）、difficulty 白名单（`hard` → `HARD`；非法值静默忽略且提交成功）、url 校验（含 `127.0.0.1`、`10.0.0.1`、`[::1]`、`0x7f000001`、userinfo、超长 → 拒绝且不落盘）、适配层 CORS/状态码/DO 往返（含 PATCH 走 X-Token、PUT 405）。
+
+前台网页（`page.test.mjs`）把内联脚本放进 `node:vm` + DOM 桩里实跑，断言渲染（排序 / 按钮 / 转义 / 恶意 URL 回落 / 断网态 / 空态引导）与**提交房间**全链：房号归一、载荷校验（保留字 / 长度 / 私网地址 / 难度白名单 / 备注截断）、错误码→中文、`POST /api/rooms` 的请求形状与 token 落盘、刷新后卡片带「我的」/改备注/销毁、`DELETE` 带 `X-Token`（含 `NOT_FOUND` 清凭据 / 过期凭据被剪枝）、`PATCH` 只动 note、已知服务器从房间牌推导。
 
 ## 部署
 
