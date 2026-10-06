@@ -548,7 +548,7 @@ export const PAGE_HTML = `<!doctype html>
   var POLL_MS = 60000;
   var COMMUNITY_POLL_MS = 300000;
   // v5.6 额度纪律：页面在后台标签页时两个定时器都不发请求（回到前台 visibilitychange 立刻全量刷新）。
-  // 默认加入目标：官方网页入口（房间行未携带自己的 url、或提交时未填房间地址时使用）。
+  // 默认加入目标：官方网页入口（只在这条房间链接不合法 / 缺失时使用）。
   var DEFAULT_CLIENT = 'https://weishu.jiangjiangze.icu/';
   // 本机凭据（提交房间返回的 token）：只在本源 localStorage 里，除了交回房间牌不作他用。
   var MINE_KEY = 'sp.lobby.mine';
@@ -575,6 +575,83 @@ export const PAGE_HTML = `<!doctype html>
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
     return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
 
+  // ---- IPv6 字面量（Sourcery 🟡：全局可路由的 IPv6 不该被一刀切） ---------------------------
+  // 与服务端 src/board.js 同一张表：只拒环回/私网/ULA/链路本地/多播/文档段，全局可路由的照收
+  // （映射 ::ffff:a.b.c.d 与 NAT64 64:ff9b::/96 落到 IPv4 表上判）。
+  function parseIPv4Strict(text) {
+    var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(text || ''));
+    if (!m) return null;
+    var out = [+m[1], +m[2], +m[3], +m[4]];
+    for (var i = 0; i < 4; i++) if (out[i] > 255) return null;
+    return out;
+  }
+  function isDeniedV4(a, b, c) {
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a >= 224) return true;
+    if (a === 192 && b === 0 && (c === 0 || c === 2)) return true;
+    if (a === 192 && b === 88 && c === 99) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a === 198 && b === 51 && c === 100) return true;
+    if (a === 203 && b === 0 && c === 113) return true;
+    return false;
+  }
+  function parseIPv6(text) {
+    var s = String(text || '').trim().toLowerCase();
+    if (s.charAt(0) === '[' && s.charAt(s.length - 1) === ']') s = s.slice(1, -1);
+    if (!s || !/^[0-9a-f:.]+$/.test(s)) return null;
+    var halves = s.split('::');
+    if (halves.length > 2) return null;
+    var groupsOf = function (chunk) {
+      if (!chunk) return [];
+      var out = [];
+      var pieces = chunk.split(':');
+      for (var i = 0; i < pieces.length; i++) {
+        var piece = pieces[i];
+        if (piece.indexOf('.') >= 0) {
+          var v4 = parseIPv4Strict(piece);
+          if (!v4) return null;
+          out.push((v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]);
+        } else {
+          if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
+          out.push(parseInt(piece, 16));
+        }
+      }
+      return out;
+    };
+    var head = groupsOf(halves[0]);
+    var tail = halves.length === 2 ? groupsOf(halves[1]) : [];
+    if (head === null || tail === null) return null;
+    var groups;
+    if (halves.length === 2) {
+      var fill = 8 - head.length - tail.length;
+      if (fill < 1) return null;
+      groups = head.concat(new Array(fill).fill(0)).concat(tail);
+    } else {
+      groups = head;
+    }
+    return groups.length === 8 ? groups : null;
+  }
+  function isDeniedV6(g) {
+    if (g.every(function (x) { return x === 0; })) return true;                       // ::
+    if (g.slice(0, 7).every(function (x) { return x === 0; }) && g[7] === 1) return true; // ::1
+    if (g.slice(0, 6).every(function (x) { return x === 0; })) return true;           // ::/96 compat
+    if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) {
+      return isDeniedV4(g[6] >> 8, g[6] & 0xff, g[7] >> 8);                          // ::ffff:a.b.c.d
+    }
+    if (g[0] === 0x0064 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0) {
+      return isDeniedV4(g[6] >> 8, g[6] & 0xff, g[7] >> 8);                          // 64:ff9b::/96 NAT64
+    }
+    if ((g[0] & 0xfe00) === 0xfc00) return true;   // fc00::/7 ULA
+    if ((g[0] & 0xffc0) === 0xfe80) return true;   // fe80::/10 link-local
+    if ((g[0] & 0xff00) === 0xff00) return true;   // ff00::/8 multicast
+    if (g[0] === 0x2001 && g[1] === 0x0db8) return true; // 2001:db8::/32 documentation
+    return false;
+  }
+
   // 只允许 https + 公网主机：拒环回/私网/保留地址（与服务端 board.js 的 deny 表逐条对齐；
   // 防恶意卡片把「加入」导向点击者的内网地址）。返回规范化 href（保留路径），不合法返回 ''。
   function safeHref(raw) {
@@ -585,7 +662,11 @@ export const PAGE_HTML = `<!doctype html>
     var h = u.hostname.toLowerCase();
     if (h === 'localhost' || h === 'ip6-localhost' || h === 'ip6-loopback') return '';
     if (h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return '';
-    if (h.indexOf(':') >= 0) return '';                                  // IPv6 一律不收
+    if (h.indexOf(':') >= 0) {                                           // IPv6 字面量：只收全局可路由
+      var groups = parseIPv6(h);
+      if (!groups || isDeniedV6(groups)) return '';
+      return u.href;
+    }
     var m = h.match(/^(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)$/);
     if (m) {
       var a = +m[1], b = +m[2], c = +m[3];
@@ -683,11 +764,16 @@ export const PAGE_HTML = `<!doctype html>
     return 'open';
   }
 
+  /**
+   * 加入 / 观战目标（v7）：**以提交的那条链接为基准**，只改 room（观战时再加 spectate）——
+   * 路径（如 rainya 的 /play）与其它查询参数都保留。链接不合法 / 没带链接才回落官方网页入口。
+   */
   function targetFor(r, spectate) {
-    var base = safeOrigin(r.url) || DEFAULT_CLIENT;
-    var u = new URL(base);
+    var u;
+    try { u = new URL(safeHref(r.url) || DEFAULT_CLIENT); } catch (e) { u = new URL(DEFAULT_CLIENT); }
     u.searchParams.set('room', String(r.code || ''));
     if (spectate) u.searchParams.set('spectate', '1');
+    else u.searchParams.delete('spectate');   // 别让链接里自带的 spectate 把「加入」变成观战
     return u.toString();
   }
 
@@ -774,9 +860,15 @@ export const PAGE_HTML = `<!doctype html>
     return CODE_RE.test(raw) ? raw : '';
   }
 
-  /** 链接主机（服务器名留空时的兜底：服务端要求 serverId/serverName 非空）。 */
+  /** 链接主机（服务器名留空时的兜底：服务端要求 serverId/serverName 非空）。
+   *  用 host（含非默认端口）而不是 hostname —— 同一台机器不同端口是两个服务器，名字要能区分。 */
   function hostOf(href) {
-    try { return new URL(String(href || '')).hostname.toLowerCase(); } catch (e) { return ''; }
+    try { return new URL(String(href || '')).host.toLowerCase(); } catch (e) { return ''; }
+  }
+
+  /** 链接 origin（协议 + 主机 + 端口）——「同一台服务器」的判定基准。 */
+  function originOf(href) {
+    try { return new URL(String(href || '')).origin.toLowerCase(); } catch (e) { return ''; }
   }
 
   /**
@@ -1097,26 +1189,30 @@ export const PAGE_HTML = `<!doctype html>
     codeEchoEl.className = 'code-echo is-ok';
   }
 
-  /** 按链接主机匹配大厅里已知的服务器（用于自动补服务器名 / 用它的正式 id）。 */
-  function knownByHost(host) {
-    if (!host) return null;
+  /** 按链接 origin（协议+主机+端口）匹配大厅里已知的服务器（自动补服务器名 / 用它的正式 id）。 */
+  function knownByOrigin(origin) {
+    if (!origin) return null;
     for (var i = 0; i < known.length; i++) {
-      if (safeOrigin(known[i].origin)) {
-        try { if (new URL(known[i].origin).hostname.toLowerCase() === host) return known[i]; } catch (e) { /* ignore */ }
-      }
+      if (originOf(known[i].origin) === origin) return known[i];
     }
     return null;
   }
 
   /** 从房间牌推导已知服务器（同一台服务器的房间共享主机）。 */
   function knownFrom(rooms) {
-    var out = [], seen = {};
+    var out = [], seen = {}, named = {};
     (rooms || []).forEach(function (r) {
       var name = String(r.serverName || r.server || '').trim();
-      var key = name.toLowerCase();
-      if (!name || seen[key]) return;
+      if (!name) return;
+      var origin = safeOrigin(r.url);
+      var lower = name.toLowerCase();
+      var key = lower + '|' + origin.toLowerCase();
+      if (seen[key]) return;
+      // 同名同主机只留一条；同名但这条没主机、而已经收过带主机的同名条目 → 跳过（别拿空的覆盖）
+      if (!origin && named[lower]) return;
       seen[key] = 1;
-      out.push({ name: name, id: String(r.serverId || '').trim(), origin: safeOrigin(r.url) });
+      if (origin) named[lower] = 1;
+      out.push({ name: name, id: String(r.serverId || '').trim(), origin: origin });
     });
     return out;
   }
@@ -1233,8 +1329,8 @@ export const PAGE_HTML = `<!doctype html>
     // 服务器名：手填的优先；留空时按链接主机找大厅里的已知服务器（用它的正式 id + 展示名），
     // 再不行就让 buildPayload 用主机名兜底（服务端 serverId/serverName 必填）。
     var href = safeHref(values.url);
-    var host = href ? hostOf(href) : '';
-    var hit = knownFor(values.server) || (!values.server ? knownByHost(host) : null);
+    var origin = href ? originOf(href) : '';
+    var hit = knownFor(values.server) || (!values.server ? knownByOrigin(origin) : null);
     if (!values.server && hit) values.server = hit.name;
     if (hit && hit.id) values.serverId = hit.id;
     if (goEl) goEl.disabled = true;
@@ -1268,11 +1364,11 @@ export const PAGE_HTML = `<!doctype html>
       syncCodeEcho();
       if (!serverEl) return;
       var href = safeHref(urlEl.value);
-      var hit = href ? knownByHost(hostOf(href)) : null;
-      if (hit && (!serverEl.value || serverEl.value === serverAuto)) {
-        serverEl.value = hit.name;
-        serverAuto = hit.name;
-      }
+      var hit = href ? knownByOrigin(originOf(href)) : null;
+      var mine = !serverEl.value || serverEl.value === serverAuto;   // 手填过就不再动它
+      if (hit && mine) { serverEl.value = hit.name; serverAuto = hit.name; return; }
+      // 换了台没见过的服务器：把「上次自动填的」清掉，免得挂到旧服务器的 id/名字下
+      if (!hit && mine && serverAuto) { serverEl.value = ''; serverAuto = ''; }
     };
     urlEl.addEventListener('input', onUrl);
     urlEl.addEventListener('change', onUrl);
@@ -1292,7 +1388,7 @@ export const PAGE_HTML = `<!doctype html>
   // 测试面：纯函数与房间牌动作（页面本身只用 DOM 事件驱动它们）。
   window.__SP_PAGE = {
     safeHref: safeHref, safeOrigin: safeOrigin, normalizeCodeInput: normalizeCodeInput,
-    codeFromLink: codeFromLink, hostOf: hostOf,
+    codeFromLink: codeFromLink, hostOf: hostOf, originOf: originOf,
     buildPayload: buildPayload, errorText: errorText, knownFrom: knownFrom,
     shapeRoom: shapeRoom, mergeRooms: mergeRooms, sortRooms: sortRooms, stateOf: stateOf, ageSecOf: ageSecOf,
     submitRoom: submitRoom, destroyRoom: destroyRoom, saveNote: saveNote,
