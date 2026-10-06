@@ -41,38 +41,43 @@ async function runPage(payload, { failFetch = false } = {}) {
   return { list, els };
 }
 
+// 行数据与线上同形：board 不外泄 createdAt，只给 ageSec（这里故意混用两种形态，覆盖两条时间路径）。
+const NOW = 1_751_000_500_000;
 const ROOM_OPEN = {
   code: 'AAAA', serverId: 's1', serverName: 'raiya服', occupied: 2, capacity: 4,
-  difficulty: 'ABYSS', note: '来玩', status: 'waiting', createdAt: 1_751_000_000_000,
+  difficulty: 'ABYSS', note: '来玩', status: 'waiting', createdAt: 1_751_000_000_000, ageSec: 500,
   url: 'https://game.example.com/play',
 };
 const ROOM_LIVE = {
   code: 'BBBB', serverId: 's2', serverName: 'Lunar', occupied: 4, capacity: 4,
-  inMatch: true, status: 'playing', createdAt: 1_751_000_100_000,
+  inMatch: true, status: 'playing', ageSec: 400,
   url: 'https://stronghold.lunar.ag/',
 };
 const ROOM_FULL = {
   code: 'CCCC', serverId: 's3', serverName: '梨子湖', occupied: 4, capacity: 4,
-  status: 'full', createdAt: 1_751_000_200_000, url: 'https://xn--rlr.rinko.ai/',
+  status: 'full', ageSec: 400, url: 'https://xn--rlr.rinko.ai/',
 };
 const ROOM_HOSTILE = {
-  code: 'DDDD', serverId: 's4', serverName: 'evil', occupied: 1, capacity: 4,
-  note: '<img src=x onerror=alert(1)>', createdAt: 1_751_000_300_000,
+  code: 'DDDD', serverId: 's4', serverName: 'evil', occupied: 1, capacity: 4, ageSec: 10,
+  note: '<img src=x onerror=alert(1)>',
   url: 'http://127.0.0.1:3000/steal',
 };
 const ROOM_NOSEAT = {
-  code: 'EEEE', serverId: 's5', serverName: '老条目服',
-  createdAt: 1_750_999_000_000, url: 'https://game.example.com/',
+  code: 'EEEE', serverId: 's5', serverName: '老条目服', ageSec: 300, url: 'https://game.example.com/',
 };
 
 test('page: renders joinable first, 观战 for in-match, disabled 满员, escaped notes', async () => {
-  const { list, els } = await runPage({ ok: true, now: 0, ttlSec: 600, visitors: 7, rooms: [ROOM_FULL, ROOM_LIVE, ROOM_OPEN, ROOM_HOSTILE, ROOM_NOSEAT] });
+  const { list, els } = await runPage({ ok: true, now: NOW, ttlSec: 600, visitors: 7, rooms: [ROOM_FULL, ROOM_LIVE, ROOM_OPEN, ROOM_HOSTILE, ROOM_NOSEAT] });
 
   const html = list.innerHTML;
-  // Ordering: joinable rooms first (newest first inside the group), then the playing room, then full.
-  assert.ok(html.indexOf('DDDD') < html.indexOf('AAAA'), 'newest open room leads');
+  // Ordering: joinable rooms first, newest (smallest ageSec) first, then playing, then full.
+  assert.ok(html.indexOf('DDDD') < html.indexOf('AAAA'), 'freshest open room leads');
   assert.ok(html.indexOf('AAAA') < html.indexOf('BBBB'), 'open rooms sort before the in-match room');
   assert.ok(html.indexOf('BBBB') < html.indexOf('CCCC'), 'in-match sorts before full');
+
+  // Freshness labels: ageSec drives them (createdAt never leaves the board).
+  assert.match(html, /刚刚/);      // DDDD, ageSec 10
+  assert.match(html, /5 分钟前/);   // EEEE, ageSec 300
 
   // Actions: 加入 for open rooms, 观战 for the in-match room, disabled 满员 for the full one.
   assert.match(html, /class="btn join" data-href="https:\/\/game\.example\.com\/\?room=AAAA"/);

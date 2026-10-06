@@ -128,13 +128,22 @@ export const PAGE_HTML = `<!doctype html>
 
   // 与客户端面板同一张表（extras/public/js/lobby.js 的 MATCH_DIFFS）。
   var DIFF_NAMES = { FUNNY: '标准', NORMAL: '险境', HARD: '绝境', ABYSS: '终极' };
-  function ago(ts) {
-    if (!ts) return '';
-    var s = Math.max(0, (Date.now() - ts) / 1000);
-    if (s < 90) return '刚刚';
-    if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
-    if (s < 86400) return Math.floor(s / 3600) + ' 小时前';
-    return Math.floor(s / 86400) + ' 天前';
+
+  // board 有意不外泄 createdAt（它只发 ageSec），社区源行两者都可能缺 —— 统一折算成「已存在秒数」。
+  function ageSecOf(r, now) {
+    var ts = Number(r.createdAt);
+    if (Number.isFinite(ts) && ts > 0) return Math.max(0, (now - ts) / 1000);
+    var age = Number(r.ageSec);
+    if (Number.isFinite(age) && age >= 0) return age;
+    return -1;
+  }
+
+  function ago(sec) {
+    if (sec < 0) return '';
+    if (sec < 90) return '刚刚';
+    if (sec < 3600) return Math.floor(sec / 60) + ' 分钟前';
+    if (sec < 86400) return Math.floor(sec / 3600) + ' 小时前';
+    return Math.floor(sec / 86400) + ' 天前';
   }
 
   // 可加入 = 未对局且未满员；对局中 = 观战；满员 = 置灰（仍展示，便于换房时心里有数）。
@@ -153,16 +162,16 @@ export const PAGE_HTML = `<!doctype html>
     return u.toString();
   }
 
-  function sortRooms(rooms) {
+  function sortRooms(rooms, now) {
     function rank(r) { var s = stateOf(r); return s === 'open' ? 0 : s === 'live' ? 1 : 2; }
     return rooms.slice(0).sort(function (a, b) {
       var ra = rank(a), rb = rank(b);
-      if (ra !== rb) return ra - rb;                                    // 可加入 → 可观战 → 满员
-      return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);   // 同组内最新在前
+      if (ra !== rb) return ra - rb;                                         // 可加入 → 可观战 → 满员
+      return ageSecOf(a, now) - ageSecOf(b, now);                            // 同组内最新在前（ageSec 小的在前）
     });
   }
 
-  function card(r) {
+  function card(r, now) {
     var st = stateOf(r);
     var badge = st === 'open' ? '<span class="badge open">开放</span>'
               : st === 'live' ? '<span class="badge live">对局中</span>'
@@ -186,7 +195,7 @@ export const PAGE_HTML = `<!doctype html>
       + '<div class="row2">' + tags + '</div>'
       + seats
       + (r.note ? '<div class="note">' + esc(r.note) + '</div>' : '')
-      + '<div class="row4"><span class="ago">' + esc(ago(Number(r.createdAt))) + '</span>' + btn + '</div>'
+      + '<div class="row4"><span class="ago">' + esc(ago(ageSecOf(r, now))) + '</span>' + btn + '</div>'
       + '</div>';
   }
 
@@ -197,14 +206,15 @@ export const PAGE_HTML = `<!doctype html>
   var nextAt = 0;
 
   function render(data) {
-    var rooms = sortRooms((data && data.rooms) || []);
+    var now = Number(data && data.now) || Date.now();
+    var rooms = sortRooms((data && data.rooms) || [], now);
     statusEl.textContent = '已连接 · ' + rooms.length + ' 个房间';
     visitorsEl.textContent = (typeof data.visitors === 'number') ? '大厅访客 ' + data.visitors + ' 人' : '';
     if (!rooms.length) {
       list.innerHTML = '<div class="state"><b>现在没有公开的房间</b>开一局，把房号分享给朋友；或去下载客户端自己开服。<br/><br/><a href="https://dl.jiangjiangze.icu" target="_blank" rel="noopener">前往下载页 →</a></div>';
       return;
     }
-    list.innerHTML = rooms.map(card).join('');
+    list.innerHTML = rooms.map(function (r) { return card(r, now); }).join('');
     Array.prototype.forEach.call(list.querySelectorAll('.btn[data-href]'), function (b) {
       b.addEventListener('click', function () { window.open(b.getAttribute('data-href'), '_blank', 'noopener'); });
     });
