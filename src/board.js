@@ -40,6 +40,10 @@ export const SEATS_MAX = 8;
 /** v5.2：大厅访客窗口 —— 面板 60s 轮询一次，120s 窗口内按（设备号优先，IP 兜底）去重。 */
 export const VISIT_WINDOW_MS = 120_000;
 export const VISIT_KEY_MAX = 40;
+/** v5.6 免费额度纪律：同一个访客的时间戳最多每 60s 落一次盘。DO 的行写免费额度是 10 万/天，而原先
+ *  每次轮询都写一行（20s 轮询的网页 1 人 1 小时 = 180 写）——节流后同样活跃只有 60 写/小时，
+ *  计数口径几乎不变（窗口 120s，落盘时间最多滞后 60s）。 */
+export const VISIT_WRITE_MIN_MS = 60_000;
 export const SERVER_ID_MAX = 64;
 export const SERVER_NAME_MAX = 64;
 export const URL_MAX = 512;
@@ -453,7 +457,7 @@ export function createBoard({ state, now, random } = {}) {
   const at = (nowArg) => (Number.isFinite(nowArg) ? Number(nowArg) : clock());
 
   /** Load live entries, prune expired rooms / stale rate buckets / expired visitors.
-   *  @returns {Promise<{rooms: object[], byCode: Map<string, object>, visitorKeys: Set<string>}>} */
+   *  @returns {Promise<{rooms: object[], byCode: Map<string, object>, visitorKeys: Set<string>, visitorSeen: Map<string, number>}>} */
   async function scan(t) {
     const listed = await state.list();
     const pairs = listed instanceof Map
@@ -462,6 +466,7 @@ export function createBoard({ state, now, random } = {}) {
     const rooms = [];
     const byCode = new Map();
     const visitorKeys = new Set(); // v5.2
+    const visitorSeen = new Map(); // v5.6：key → 已落盘时间戳（写节流用）
     for (const pair of pairs) {
       if (!pair) continue;
       const key = pair[0];
@@ -485,29 +490,35 @@ export function createBoard({ state, now, random } = {}) {
         if (kept.length === 0) await state.delete(key);
         else if (kept.length !== value.length) await state.put(key, kept);
       } else if (key.startsWith(VISIT_PREFIX)) {
-        // v5.2：窗口外的访客过期即清；存活者进集合供本次计数
+        // v5.2：窗口外的访客过期即清；存活者进集合供本次计数（v5.6：并把时间戳带上，供写节流判断）
         if (!Number.isFinite(value) || t - value >= VISIT_WINDOW_MS || t - value < 0) {
           await state.delete(key);
         } else {
-          visitorKeys.add(key.slice(VISIT_PREFIX.length));
+          const visitor = key.slice(VISIT_PREFIX.length);
+          visitorKeys.add(visitor);
+          visitorSeen.set(visitor, value);
         }
       }
     }
-    return { rooms, byCode, visitorKeys };
+    return { rooms, byCode, visitorKeys, visitorSeen };
   }
 
   /** rainya-shaped board payload; expired entries are dropped (and pruned) here.
    *  v5.2：`opts.visitorKey`（设备号优先、IP 兜底）在**同一次请求里**记一个大厅访客，
-   *  响应带 `visitors`（120s 窗口内去重）——「用户提交当前进度」零额外请求。 */
+   *  响应带 `visitors`（120s 窗口内去重）——「用户提交当前进度」零额外请求。
+   *  v5.6：写节流 —— 同一个访客的时间戳 60s 内只落一次盘（见 VISIT_WRITE_MIN_MS）。 */
   async function list(nowArg, opts) {
     const t = at(nowArg);
-    const { rooms, visitorKeys } = await scan(t);
+    const { rooms, visitorKeys, visitorSeen } = await scan(t);
     const visitorKey = sanitizeVisitorKey((opts && opts.visitorKey) || '')
       || sanitizeVisitorKey((opts && opts.ip) || '');
     if (visitorKey) {
-      // 每次轮询都刷新时间戳：活跃访客始终留在窗口内（1 次写/轮询，与 60s 节奏同量级）
+      // 计数照旧（窗口内的 key 已在集合里），但落盘节流：窗口内已记过就不写。
       visitorKeys.add(visitorKey);
-      await state.put(VISIT_PREFIX + visitorKey, t);
+      const seenAt = visitorSeen.get(visitorKey);
+      if (!(Number.isFinite(seenAt) && t - seenAt >= 0 && t - seenAt < VISIT_WRITE_MIN_MS)) {
+        await state.put(VISIT_PREFIX + visitorKey, t);
+      }
     }
     rooms.sort((a, b) => b.createdAt - a.createdAt || (a.code < b.code ? -1 : 1)); // newest first
     return { ok: true, now: t, ttlSec: TTL_SEC, visitors: visitorKeys.size, rooms: rooms.map((entry) => toPublic(entry, t)) };

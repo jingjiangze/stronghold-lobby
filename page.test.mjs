@@ -52,9 +52,10 @@ function plain(value) {
  * @param {(url:string, options:object) => object} [opts.fetch]  custom responder (records calls)
  * @param {Record<string, object[]>} [opts.community]  rows per relayed community source
  * @param {object} [opts.seed]  initial localStorage contents
- * @returns {Promise<{list:object, els:object, api:object, calls:object[], store:Map<string,string>}>}
+ * @param {boolean} [opts.hidden]  start with document.hidden = true (background tab)
+ * @returns {Promise<{list:object, els:object, api:object, calls:object[], store:Map<string,string>, doc:object}>}
  */
-async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, community = {}, seed = {} } = {}) {
+async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, community = {}, seed = {}, hidden = false } = {}) {
   const script = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)[1];
   const els = {};
   const el = (id) => (els[id] = els[id] || makeEl(id));
@@ -74,7 +75,7 @@ async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, co
     document: {
       getElementById: (id) => el(id),
       addEventListener: () => {},
-      hidden: false,
+      hidden: hidden,
     },
     window: { open: () => { throw new Error('window.open must only fire on a real click'); } },
     localStorage: {
@@ -89,7 +90,7 @@ async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, co
   vm.createContext(ctx);
   vm.runInContext(script, ctx);
   await new Promise((resolve) => setTimeout(resolve, 0)); // let the fetch microtask chain settle
-  return { list: el('list'), els, api: ctx.window.__SP_PAGE, calls, store };
+  return { list: el('list'), els, api: ctx.window.__SP_PAGE, calls, store, doc: ctx.document };
 }
 
 // 行数据与线上同形：board 不外泄 createdAt，只给 ageSec（这里故意混用两种形态，覆盖两条时间路径）。
@@ -255,6 +256,23 @@ test('page: 排序 — 可加入 → 对局中 → 满员；无时间戳的常�
 
   const sorted = api.sortRooms([full, station, stale, playing, fresh], NOW).map((r) => r.code);
   assert.deepEqual(sorted, ['AAAA', 'BBBB', 'CCCC', 'DDDD', 'EEEE']);
+});
+
+test('page: 后台标签页不发任何请求，回到前台立刻全量刷新（额度纪律）', async () => {
+  const payload = { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] };
+  const { api, calls, doc, els } = await runPage(payload, {
+    hidden: true,
+    community: { rainya: [COMMUNITY_RAINYA], lunar: [], rinko: [] },
+  });
+  assert.equal(calls.length, 0, 'hidden tab: no board poll, no relay poll');
+  assert.equal(els.status.textContent, '', 'no render happened — the page stays on its static loading state');
+  assert.match(PAGE_HTML, /正在拉取房间牌/, 'the static loading state is what a hidden tab keeps showing');
+
+  doc.hidden = false;
+  await api.load();
+  assert.ok(calls.length >= 4, 'back to the foreground: one full refresh (board + three relays)');
+  assert.match(els.list.innerHTML, /AAAA/);
+  assert.match(els.list.innerHTML, /KKKK/, "community rows come along on the refresh");
 });
 
 test('page: empty board and offline state render explicit guidance', async () => {
