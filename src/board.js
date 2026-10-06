@@ -656,9 +656,12 @@ export function createBoard({ state, now, random } = {}) {
       return fail('FORBIDDEN', 'token / serverId do not match this room');
     }
 
-    // note 语义保持 v5.1（缺省/空白 = 清空）；v5.2 追加直播字段：只覆盖「本次带上」的那些，
-    // 不刷新 TTL，也不动 createdAt/url/token/ip/difficulty。
-    const note = sanitizeNote(raw.note);
+    // note 语义（2026-10-07 修订）：**键缺席 = 不动**（保留房主/网页表单写的那一行），带键则照旧
+    // （'' / null = 清空）。旧客户端 PATCH 时永远带 note 键 → 行为零变化；新客户端（APK 心跳拿不到
+    // 自己那一行时省略 note）因此不会再把网页表单里填的备注清掉。
+    // v5.2 追加直播字段：只覆盖「本次带上」的那些，不刷新 TTL，也不动 createdAt/url/token/ip/difficulty。
+    const hasNote = Object.prototype.hasOwnProperty.call(raw, 'note');
+    const note = hasNote ? sanitizeNote(raw.note) : stored.note;
     const live = sanitizeLiveFields(raw);
     await state.put(roomKey(code), { ...stored, note, ...live });
     return { ok: true, updated: { code, serverId: stored.serverId, note, ...live } };

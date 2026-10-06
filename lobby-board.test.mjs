@@ -617,11 +617,27 @@ test('update: note truncated/cleaned to 40 code points; NOT_FOUND when absent or
   assert.equal(long.updated.note, 'go' + '😀'.repeat(38), 'control chars stripped, trimmed, 40 code points');
   assert.equal(Array.from(long.updated.note).length, NOTE_MAX);
 
-  // missing/blank note clears it (sanitizeNote('') === ''), matching add()
-  const cleared = await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token }, T0 + 2_000);
+  // note 键缺席 = 不动（2026-10-07 修订）：心跳拿不到自己那一行时省略 note，不该清掉别人写的备注
+  const kept = await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token }, T0 + 2_000);
+  assert.equal(kept.ok, true);
+  assert.equal(kept.updated.note, long.updated.note, 'absent note keeps the stored value');
+  assert.equal((await board.list(T0 + 2_000)).rooms[0].note, long.updated.note);
+
+  // 带键则照旧（旧客户端永远带键，行为零变化）：'' / null 仍表示清空
+  const clearedNull = await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token, note: null }, T0 + 2_100);
+  assert.equal(clearedNull.updated.note, '');
+  await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token, note: 'x' }, T0 + 2_150);
+  const cleared = await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token, note: '' }, T0 + 2_200);
   assert.equal(cleared.ok, true);
-  assert.equal(cleared.updated.note, '');
-  assert.equal((await board.list(T0 + 2_000)).rooms[0].note, '');
+  assert.equal(cleared.updated.note, '', 'explicit empty string still clears');
+  assert.equal((await board.list(T0 + 2_200)).rooms[0].note, '');
+
+  // 直播字段同样只覆盖「本次带上」的
+  await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token, occupied: 2, capacity: 4, note: 'live' }, T0 + 2_300);
+  await board.update({ code: 'ABCD', serverId: 'srv-a', token: added.token, note: 'live' }, T0 + 2_400);
+  const stored2 = (await board.list(T0 + 2_400)).rooms[0];
+  assert.equal(stored2.occupied, 2, 'live fields survive an update that omits them');
+  assert.equal(stored2.capacity, 4);
 
   const badCode = await board.update({ code: 'nope', serverId: 'srv-a', token: added.token, note: 'x' }, T0 + 2_000);
   assert.equal(badCode.ok, false);

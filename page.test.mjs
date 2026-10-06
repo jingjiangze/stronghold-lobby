@@ -305,7 +305,8 @@ test('page: 后台标签页不发任何请求，回到前台立刻全量刷新�
 
   doc.hidden = false;
   await api.load();
-  assert.equal(calls.length, 2, 'one full refresh = board + one combined relay');
+  const polls = calls.filter((c) => c.url.indexOf('/api/') >= 0);
+  assert.equal(polls.length, 2, 'one full refresh = board + one combined relay');
   assert.match(els.list.innerHTML, /AAAA/);
   assert.match(els.list.innerHTML, /KKKK/, "community rows come along on the refresh");
 });
@@ -364,9 +365,10 @@ test('page: empty board and offline state render explicit guidance', async () =>
 test('page: 提交房间面板默认折叠，且新增能力不需要放开 CSP', () => {
   assert.match(PAGE_HTML, /<section class="lobby-submit" id="submit" hidden>/);
   assert.match(PAGE_HTML, /id="open-submit"/);
-  // The page stays same-origin only: connect-src 'self', fonts/images are inline data: URIs.
-  assert.match(PAGE_HTML, /connect-src 'self'/);
-  assert.ok(!/connect-src[^"]*https:/.test(PAGE_HTML), 'no third-party connect-src');
+  // 数据来源仍然是同源（房间牌 + 社区中转都走 /api/*），只额外允许 https: —— 这是为了 C 方案的
+  // 服务器级兜底数字：行上缺房间人数时直连那个服的 /healthz 读一次公开聚合数字（只读、按 origin 缓存）。
+  assert.match(PAGE_HTML, /connect-src 'self' https:/);
+  assert.ok(!/connect-src[^"]*\*/.test(PAGE_HTML), 'no wildcard connect-src');
   assert.match(PAGE_HTML, /font-src data:/);
   assert.ok(!/https?:\/\/[^"']*\.woff2/.test(PAGE_HTML), 'fonts are embedded, not linked');
 });
@@ -572,4 +574,50 @@ test('page: 已知服务器从房间牌推导（供提交表单选，并自动�
     { name: 'raiya服', id: 's1', origin: 'https://game.example.com/' },
     { name: '梨子湖', id: 's3', origin: 'https://xn--rlr.rinko.ai/' },
   ]);
+});
+
+test('probe (C)：行上缺房间人数时读该服 /healthz，标「服务器级」；有数字的行不探', async () => {
+  const payload = { ok: true, now: NOW, rooms: [ROOM_OPEN, ROOM_NOSEAT] };
+  const probes = [];
+  const { els, calls } = await runPage(payload, {
+    fetch: (url) => {
+      if (url.indexOf('/healthz') >= 0) {
+        probes.push(url);
+        return jsonRes({ ok: true, rooms: 2, humans: 7, uptime: 10 });
+      }
+      return jsonRes(payload);
+    },
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(probes, ['https://game.example.com/healthz'], '只探缺数字那一行的 origin，且只探一次');
+  assert.match(els.list.innerHTML, /该服当前 7 人 · 2 房/, '显示服务端自报的聚合数字');
+  assert.match(els.list.innerHTML, /服务器级/, '必须标出层级');
+  assert.match(els.list.innerHTML, /2\/4/, '房主上报过的那一行照旧显示房间级数字');
+  assert.ok(!calls.some((c) => c.url.indexOf('127.0.0.1') >= 0), '私网/非 https 的行绝不探');
+});
+
+test('probe (C)：读不到数字（或 Workers 变体不报 humans/rooms）→ 静默，绝不显示 0', async () => {
+  const payload = { ok: true, now: NOW, rooms: [ROOM_NOSEAT] };
+  const { els } = await runPage(payload, {
+    fetch: (url) => (url.indexOf('/healthz') >= 0 ? jsonRes({ ok: true, uptime: 3 }) : jsonRes(payload)),
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(!/该服当前/.test(els.list.innerHTML), '没有数字就什么都不显示');
+  assert.ok(!/0 人/.test(els.list.innerHTML), '绝不编一个 0 出来');
+  assert.ok(!/服务器级/.test(els.list.innerHTML));
+});
+
+test('probe (C)：按 origin 缓存 60s —— 两次刷新只探一次', async () => {
+  const payload = { ok: true, now: NOW, rooms: [ROOM_NOSEAT] };
+  const probes = [];
+  const { api } = await runPage(payload, {
+    fetch: (url) => {
+      if (url.indexOf('/healthz') >= 0) { probes.push(url); return jsonRes({ ok: true, humans: 1, rooms: 1 }); }
+      return jsonRes(payload);
+    },
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  await api.load();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(probes.length, 1, '60s 窗口内同一 origin 只探一次');
 });

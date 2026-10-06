@@ -50,7 +50,7 @@ tools/apk/lobby-worker/
 | GET | `/` `/index.html` | — | `200 text/html` | **前台网页**（见下节）；`cache-control: public, max-age=60`；非 GET/HEAD → 405；纯静态，不碰 DO |
 | GET | `/api/rooms` | 可选头 `X-Device`（设备号） | `200 {ok,now,ttlSec,visitors,rooms[]}` | `now` 为 epoch 毫秒；只含未过期条目，最新在前。**v5.2**：同一次请求顺带记一个大厅访客（`X-Device` 优先、IP 兜底），`visitors` = 120s 窗口内去重访客数——零额外请求。**v5.6**：访客心跳写节流（`VISIT_WRITE_MIN_MS` 60s，同 key 60s 内只落一行；DO 行写免费额度 10 万/天） |
 | POST | `/api/rooms` | JSON `{code, serverId, serverName, note?, url?, difficulty?, mode?, status?, occupied?, capacity?}` | `201 {ok:true, added, token}` | `token` = 128bit hex（32 字符），请客户端保存；**v5.2 直播字段**白名单化（非法值忽略，绝不因此拒绝提交） |
-| PATCH | `/api/rooms` | JSON `{code, serverId, note, mode?, status?, occupied?, capacity?}`，头 `X-Token: <token>` | `200 {ok:true, updated:{code,serverId,note,+直播字段}}` | 仅 token+serverId **完全匹配**才可编辑；`note` 缺省/空白 = 清空；**v5.2** 起可同时刷新直播字段（只覆盖本次带上者），`createdAt`/`url`/`token` 不动，**不刷新 TTL**、不新增限流桶 |
+| PATCH | `/api/rooms` | JSON `{code, serverId, note, mode?, status?, occupied?, capacity?}`，头 `X-Token: <token>` | `200 {ok:true, updated:{code,serverId,note,+直播字段}}` | 仅 token+serverId **完全匹配**才可编辑；**`note` 键缺席 = 不动**（2026-10-07 修订；带键则照旧，`''`/`null` = 清空——旧客户端永远带键，行为零变化，新客户端拿不到自己那一行时省略 note 即可保住别人写的备注）；**v5.2** 起可同时刷新直播字段（只覆盖本次带上者），`createdAt`/`url`/`token` 不动，**不刷新 TTL**、不新增限流桶 |
 | DELETE | `/api/rooms?code=&serverId=` | 头 `X-Token: <token>` | `200 {ok:true, removed:{code,serverId}}` | 仅凭 token+serverId 匹配才可销毁 |
 | GET | `/api/community?src=rainya\|lunar\|rinko`（**v6：逗号列表 1..3 个**，如 `?src=rainya,lunar,rinko`） | — | `200 {ok,src,fetchedAt,rooms[]}`；合并形态逐行带 `src`，某源失败进 `errors:{key:'UPSTREAM'}`、只有全失败才 502 | **社区源中转**（三家上游都不发 CORS 头）。`src` 只认这三个白名单值、不接受任何多余参数；逗号列表必须**规范拼写**（白名单顺序、无重复、无空条目、无空白，≤3 个）——同一组源只有一种 URL，缓存键唯一；完整成功的 200 带 `public, max-age=10, s-maxage=60`（部分失败退回 10），错误一律 `no-store`（防 CF 负缓存） |
 | GET | `/api/match?id=<handle>` | 可选头 `X-Token` | `200 {ok,state:'waiting',waiting,need,queuedSec}` 或 `{ok,state:'matched',role,matchId,room}` 或 `{ok,state:'expired'}` | 队列/对局状态轮询；`token` 不匹配 → 403 |
@@ -79,7 +79,8 @@ tools/apk/lobby-worker/
   - 提交成功后 token 只存本源 `localStorage['sp.lobby.mine']`（`code → {token, serverId, serverName, expiresAt}`）；此后这间房的行带「我的」徽标、剩余时间，以及「改备注」（PATCH）与「销毁」（DELETE）按钮——APK 面板同一套房间牌动作，页面侧**零服务端改动**（三条路由与 CORS 早已就绪）；
   - 服务端约束照旧生效：同 IP ≤5 条未过期、10 次/60 s、同房号 30 s 防抖、TTL 600 s、保留字（`sp-phone-host`/`local`/`auto`）与私网地址拒绝；错误码在页面本地翻译成中文提示（`DEBOUNCED` → 「30 秒后再试」等）；
   - token 是唯一凭据（服务端 PATCH/DELETE 要求 token + serverId 双匹配）；显示层从不把它发给第三方，只交回房间牌。
-- 页面只请求同源端点（`/api/rooms` 的 GET/POST/PATCH/DELETE 与 `/api/community`），不加载任何外部资源；CSP `default-src 'none'` + `connect-src 'self'`（字体/图标为内嵌 `data:` URI，故另开 `font-src data:` / `img-src data:`）。
+- 页面只请求同源端点（`/api/rooms` 的 GET/POST/PATCH/DELETE 与 `/api/community`），不加载任何**外部资源**；CSP `default-src 'none'` + `connect-src 'self' https:`（字体/图标为内嵌 `data:` URI，故另开 `font-src data:` / `img-src data:`）。
+  `https:` 这一项只服务于「服务器级兜底数字」：行上缺房间人数时直连那个服的 `/healthz` 读一次公开只读聚合数字（按 origin 60s 缓存、失败指数退避且静默、绝不显示 0、文案标「服务器级」；origin 先过 `safeHref` 的同一张拒绝表，非 https / 私网 / 保留地址一律不探）。
 
 房间条目（`rooms[i]` / `added`）：
 
@@ -139,7 +140,7 @@ url 的 host 拒绝表与 `tools/apk/overlay/sp-connect.mjs`（shell 出站守�
 
 - 仅用 **Durable Object storage**（`state.storage.get/put/delete/list`），不用 Workers KV；单例经 `idFromName('board')`。DO 输入门自带串行化，读-改-写无需额外锁。
 - 键：`room:<CODE>`（条目，含 `token`/`ip`/`createdAt`，对外输出永不带出）与 `rate:<ip>`（近期成功提交时间戳），过期/陈旧键在读取路径顺手清理。
-- PATCH 编辑备注只替换 `note` 字段，`createdAt`（以及 `url`/`token`/`ip`/`difficulty`）保持不动，故**不刷新 TTL**：剩余时间仍从首次提交算起。
+- PATCH 编辑备注只替换 `note` 字段（**键缺席则连 `note` 都不动**），`createdAt`（以及 `url`/`token`/`ip`/`difficulty`）保持不动，故**不刷新 TTL**：剩余时间仍从首次提交算起。
 - 规模上限：单 IP ≤5 条、TTL 600s，DO storage 体量很小。
 
 ### 跨服匹配队列（`idFromName('match')` 独立 DO）

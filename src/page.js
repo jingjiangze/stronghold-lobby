@@ -37,7 +37,7 @@ export const PAGE_HTML = `<!doctype html>
 <meta name="format-detection" content="telephone=no" />
 <meta name="description" content="卫戍协议：盟约 · 联机大厅（非官方同人作品）" />
 <meta http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; font-src data:; img-src data:; base-uri 'none'; form-action 'none'" />
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self' https:; font-src data:; img-src data:; base-uri 'none'; form-action 'none'" />
 <title>卫戍协议：盟约 · 联机大厅</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' fill='%230c0f0e'/%3E%3Cpath fill='%234ed8af' d='M5 3h3v2h2V3h4v2h2V3h3v5l-2 2v7l2 2v2H5v-2l2-2v-7L5 8z'/%3E%3C/svg%3E" />
 <style>
@@ -319,6 +319,10 @@ export const PAGE_HTML = `<!doctype html>
   .room__bottom{display:flex; align-items:center; gap:.12rem; flex-wrap:wrap; margin-top:.02rem}
   .room__seats{display:flex; align-items:center; gap:.08rem; font-size:.13rem; color:var(--text-lo); flex:0 0 auto}
   .room__seats .num{font-size:.15rem; color:var(--text-md)}
+  /* C：服务器级兜底数字（不是本房间的人数）——视觉上要弱于房主上报的那一条，并带「服务器级」字样。 */
+  .room__seats--server{gap:.06rem}
+  .room__seats--server .num{font-size:.13rem; color:var(--text-lo)}
+  .room__seats--server .micro{color:var(--text-lo); opacity:.75}
   .room__bar{display:block; width:.9rem; height:.1rem; border:1px solid var(--line-2); background:rgba(0,0,0,.35)}
   .room__bar i{display:block; height:100%; background:linear-gradient(90deg, var(--mint-600), var(--mint-glow))}
   .room.is-full .room__bar i{background:var(--red)}
@@ -520,7 +524,9 @@ export const PAGE_HTML = `<!doctype html>
         <a href="https://game.rainya.me/" target="_blank" rel="noopener noreferrer" title="raiya 服">raiya服（game.rainya.me）</a> ·
         <a href="https://stronghold.lunar.ag/" target="_blank" rel="noopener noreferrer" title="Lunar 服">Lunar（stronghold.lunar.ag）</a> ·
         <a href="https://xn--rlr.rinko.ai/" target="_blank" rel="noopener noreferrer" title="梨子湖（卫.rinko.ai）">梨子湖（卫.rinko.ai）</a><span id="src-state"></span><br />
-        社区房间由各站自行维护、本站只读转发；行上的来源标签可以点开对应站点，「加入」会打开房间所在站点。
+        社区房间由各站自行维护、本站只读转发；行上的来源标签可以点开对应站点，「加入」会打开房间所在站点。<br />
+        行上没有房间人数时，本站会直接向该服读一次公开的聚合数字（<code>/healthz</code>，只读、不带任何你的信息），
+        并用「服务器级」标出层级；读不到就不显示，绝不推算。
       </p>
 
       <p class="dl-links">
@@ -711,6 +717,7 @@ export const PAGE_HTML = `<!doctype html>
       url: url, host: host,
       occupied: Number.isInteger(occ) && occ >= 0 ? occ : -1,
       capacity: Number.isInteger(cap) && cap > 0 ? cap : -1,
+      humans: Number.isInteger(Number(raw.humans)) && Number(raw.humans) >= 0 ? Number(raw.humans) : -1,
       difficulty: typeof raw.difficulty === 'string' ? raw.difficulty.slice(0, 12) : '',
       difficultyName: typeof raw.difficultyName === 'string' ? raw.difficultyName.slice(0, 16) : '',
       mode: raw.mode === 'coop' || raw.mode === 'solo' ? raw.mode : '',
@@ -1104,6 +1111,71 @@ export const PAGE_HTML = `<!doctype html>
       + ' title="房间来源：' + esc(info.label + '（' + info.host + '）') + '">' + esc(info.host) + '</a>';
   }
 
+  // ---- v7.x: 服务器级兜底数字（C） ---------------------------------------------------------------
+  // 行上没有**房间级**人数（房主没上报容量）时，去那个服的 /healthz 读一眼聚合数字。六条纪律：
+  //   ① 只探公网 https（复用 safeHref 的同一张拒绝表：非 https / 私网 / 保留地址一律不探）；
+  //   ② 只探「缺房间级数字」的行；③ 每 origin 60s 缓存；④ 失败静默 + 指数退避（有上界）；
+  //   ⑤ **绝不显示 0**（读不到就什么都不显示）；⑥ 文案必须标「服务器级」。
+  var probeCache = {};                 // origin → { at, doc, fails, nextAt }
+  var probeInflight = {};
+  var PROBE_TTL_MS = 60000;
+  var PROBE_TIMEOUT_MS = 3500;
+  var PROBE_BACKOFF_MAX_MS = 600000;
+
+  function probeOriginOf(r) {
+    var href = safeHref(r && r.url);   // 同一张拒绝表：不合格直接空串 → 不探
+    if (!href) return '';
+    try { return new URL(href).origin; } catch (e) { return ''; }
+  }
+
+  /** 行上缺房间级数字、且它那个 origin 合格 → 才需要探。 */
+  function probeNeeded(r) {
+    return !!(r && Number(r.capacity) <= 0 && probeOriginOf(r));
+  }
+
+  /** 「该服当前 N 人 · M 房」；读不到（含 Workers 变体不报 humans/rooms）返回空串。 */
+  function probeTextOf(r) {
+    var p = probeCache[probeOriginOf(r)];
+    var doc = p && p.doc;
+    if (!doc) return '';
+    var humans = Number(doc.humans), rooms = Number(doc.rooms);
+    if (!Number.isFinite(humans) || !Number.isFinite(rooms)) return '';
+    return '该服当前 ' + humans + ' 人 · ' + rooms + ' 房';
+  }
+
+  function probeKick(rows) {
+    // 额度纪律：后台标签页一个请求都不发（回到前台 visibilitychange → load() → render() 会重来）。
+    if (typeof document !== 'undefined' && document.hidden) return;
+    var now = Date.now();
+    for (var i = 0; i < rows.length; i++) {
+      var origin = probeNeeded(rows[i]) ? probeOriginOf(rows[i]) : '';
+      if (!origin || probeInflight[origin]) continue;
+      var rec = probeCache[origin] || (probeCache[origin] = { at: 0, doc: null, fails: 0, nextAt: 0 });
+      if (now - rec.at < PROBE_TTL_MS || now < rec.nextAt) continue;
+      probeInflight[origin] = true;
+      (function (o, rec2) {
+        var init = { mode: 'cors', cache: 'no-store', headers: { accept: 'application/json' } };
+        try { init.signal = AbortSignal.timeout(PROBE_TIMEOUT_MS); } catch (e) { /* 老引擎：无超时 */ }
+        fetch(o + '/healthz', init).then(function (res) {
+          if (!res || !res.ok) throw new Error('HTTP ' + (res && res.status));
+          return res.json();
+        }).then(function (doc) {
+          rec2.doc = doc && typeof doc === 'object' ? doc : null;
+          rec2.at = Date.now();
+          rec2.fails = 0;
+          rec2.nextAt = 0;
+          delete probeInflight[o];
+          render(); // 拿到就重画一次（不额外轮询、不动 30s 节奏）
+        }, function () {
+          rec2.fails += 1;
+          rec2.at = Date.now(); // 失败也记时间：TTL 内不再打
+          rec2.nextAt = Date.now() + Math.min(PROBE_BACKOFF_MAX_MS, PROBE_TTL_MS * Math.pow(2, rec2.fails));
+          delete probeInflight[o];
+        });
+      })(origin, rec);
+    }
+  }
+
   function card(r, now, mine) {
     var st = stateOf(r);
     var mineEntry = mine[r.code] || null;
@@ -1114,9 +1186,13 @@ export const PAGE_HTML = `<!doctype html>
     var occ = Number(r.occupied) || 0, cap = Number(r.capacity) || 0;
     var pct = cap > 0 ? Math.min(100, Math.round(occ / cap * 100)) : 0;
     // 人数行只在房主上报过容量时出现（未上报的旧条目显示 0/0 只会误导）。
+    // v7.x（C）：没上报容量时，若探到「服务器级」聚合数字就显示它，并明确标注层级——绝不编数字。
+    var probeText = cap > 0 ? '' : probeTextOf(r);
     var seats = cap > 0
       ? '<span class="room__seats"><span class="num">' + occ + '/' + cap + '</span> 人<span class="room__bar"><i style="width:' + pct + '%"></i></span></span>'
-      : '';
+      : (probeText
+        ? '<span class="room__seats room__seats--server" title="该服务器自报的聚合数字，不是本房间的人数"><span class="num">' + esc(probeText) + '</span><span class="micro">服务器级</span></span>'
+        : '');
     var badgeText = st === 'open' ? '开放' : st === 'live' ? '对局中' : '满员';
     var badges = '<span class="room__badges">'
       + (mineEntry ? '<span class="badge is-mine">我的</span>' : '')
@@ -1233,6 +1309,7 @@ export const PAGE_HTML = `<!doctype html>
       board: sources.board.list, rainya: sources.rainya.list,
       lunar: sources.lunar.list, rinko: sources.rinko.list,
     }), now);
+    probeKick(rooms); // C：行上缺房间级数字时，顺路读一眼那个服的 /healthz（公开只读聚合数字）
     var mine = liveMine();
     last = rooms;
 
