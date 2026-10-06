@@ -14,14 +14,20 @@
 //                          (only the note changes; createdAt/TTL/url are NOT refreshed)
 //   DELETE /api/rooms?code=&serverId=      header X-Token: <token>          -> 200 { ok, removed }
 //   GET  /api/community?src=rainya|lunar|rinko   relayed { ok, src, fetchedAt, rooms:[...] }
+//        v6: `src` also accepts a comma list (1..3 whitelist keys, order preserved, deduped):
+//        `?src=rainya,lunar,rinko` answers once for all of them — rows get a per-row `src`, a source
+//        that fails lands in `errors:{<key>:'UPSTREAM'}` instead of failing the whole call (all three
+//        failing is still a 502). The lobby page uses the combined form: one request per cycle
+//        instead of three (96 → 72 requests/hour per visible tab).
 //   GET  /api/match?id=<handle>            queue/match status for one searcher
 //   POST /api/match {difficulty, venue:{kind, serverId?}}    join the cross-server match queue
 //   POST /api/match/room {id, code, serverId, url?}          header X-Token — the HOST posts the room
 //   DELETE /api/match?id=<handle>          header X-Token — leave the queue / drop out of a match
 //   GET  /api/health       { ok:true, now } — stateless liveness probe for deploy self-check
-// Board responses carry `cache-control: no-store`; the community relay's 200 uses a short
-// `public, max-age=10, s-maxage=10` so edge caching absorbs the 15s client poll, while every error
-// path stays `no-store` (never let a 4xx/5xx poison the CDN — the negative-cache lesson).
+// Board responses carry `cache-control: no-store`; the community relay's 200 uses
+// `public, max-age=10, s-maxage=60` (partial answers 10) so a zone Cache Rule can serve repeat
+// polls from the edge without invoking this Worker, while every error path stays `no-store`
+// (never let a 4xx/5xx poison the CDN — the negative-cache lesson).
 // Error codes -> HTTP status: BAD_JSON/BAD_CODE/BAD_SERVER/BAD_URL/BAD_SRC/BAD_DIFFICULTY/BAD_VENUE/
 // BAD_ID 400, FORBIDDEN 403, NOT_FOUND 404, METHOD_NOT_ALLOWED 405, RATE_LIMITED/DEBOUNCED/
 // LIMIT_REACHED 429, INTERNAL 500.
@@ -95,18 +101,17 @@ function mapLiveRoom(source, row) {
   return out;
 }
 
-/** Relay one community source. Returns { status, body, cache } — the caller attaches CORS. */
-async function relayCommunity(src, env) {
-  const source = Object.prototype.hasOwnProperty.call(COMMUNITY_SOURCES, src) ? COMMUNITY_SOURCES[src] : null;
-  if (!source) return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };
+/** Relay ONE community source. Returns { ok:true, rooms } | { ok:false } — no HTTP shape here,
+ *  so the single-source and the combined (comma-list) paths share one implementation. */
+async function relayOne(key, env) {
+  const source = Object.prototype.hasOwnProperty.call(COMMUNITY_SOURCES, key) ? COMMUNITY_SOURCES[key] : null;
+  if (!source) return { ok: false };
 
   // Defensive validation even though every upstream is a frozen constant: scheme must be https and
   // the host must not be loopback/private/reserved (same deny table the board uses for submitted URLs).
   let target = null;
   try { target = new URL(source.url); } catch { target = null; }
-  if (!target || target.protocol !== 'https:' || targetHostDenyReason(target.hostname)) {
-    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
-  }
+  if (!target || target.protocol !== 'https:' || targetHostDenyReason(target.hostname)) return { ok: false };
 
   const timeoutMs = Number(env && env.RELAY_TIMEOUT_MS) > 0 ? Number(env.RELAY_TIMEOUT_MS) : RELAY_TIMEOUT_MS;
   let res;
@@ -118,36 +123,76 @@ async function relayCommunity(src, env) {
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch {
-    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
+    return { ok: false };
   }
-  if (!res.ok) return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
+  if (!res.ok) return { ok: false };
 
   let text;
-  try { text = await res.text(); } catch {
-    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
-  }
-  if (text.length > RELAY_MAX_TEXT) {
-    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
-  }
+  try { text = await res.text(); } catch { return { ok: false }; }
+  if (text.length > RELAY_MAX_TEXT) return { ok: false };
   let data;
-  try { data = JSON.parse(text); } catch {
-    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
-  }
+  try { data = JSON.parse(text); } catch { return { ok: false }; }
 
   let rooms;
-  if (src === 'rainya') {
+  if (key === 'rainya') {
     rooms = data && Array.isArray(data.rooms) ? data.rooms : null;
   } else {
     const items = data && Array.isArray(data.items) ? data.items : null;
     rooms = items ? items.map((row) => mapLiveRoom(source, row)).filter(Boolean) : null;
   }
-  if (!rooms) return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
+  if (!rooms) return { ok: false };
+  return { ok: true, rooms };
+}
 
-  return {
-    status: 200,
-    body: { ok: true, src, fetchedAt: Date.now(), rooms },
-    cache: 'public, max-age=10, s-maxage=10',
-  };
+/** Full success is edge-cacheable for 60s (a zone Cache Rule may serve repeat polls without running
+ *  this Worker); a partial answer keeps the old 10s so a recovered source is picked up quickly. */
+const RELAY_CACHE_FULL = 'public, max-age=10, s-maxage=60';
+const RELAY_CACHE_PARTIAL = 'public, max-age=10, s-maxage=10';
+/** Max sources in one combined call (there are only three; the cap keeps the URL grammar tight). */
+const RELAY_SRC_MAX = 3;
+
+/**
+ * Relay the community sources named by `srcParam` (one key, or a comma list of 1..3 whitelist keys).
+ *   ?src=lunar          → the historic single-source envelope（形状不变）
+ *   ?src=rainya,lunar   → { ok, src:'rainya,lunar', fetchedAt, rooms:[{...,src:'rainya'|'lunar'}],
+ *                           errors?: { <key>: 'UPSTREAM' } } — 一个源挂了不拖垮整次调用；三个全挂才 502。
+ * Returns { status, body, cache } — the caller attaches CORS.
+ */
+async function relayCommunity(srcParam, env) {
+  const keys = String(srcParam == null ? '' : srcParam)
+    .split(',')
+    .map((k) => k.trim())
+    .filter((k) => k !== '');
+  const unique = [];
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(COMMUNITY_SOURCES, key)) {
+      return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };
+    }
+    if (!unique.includes(key)) unique.push(key);
+  }
+  if (unique.length === 0 || unique.length > RELAY_SRC_MAX) {
+    return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };
+  }
+
+  const results = await Promise.all(unique.map((key) => relayOne(key, env)));
+  const failed = unique.filter((key, i) => !results[i].ok);
+  if (failed.length === unique.length) {
+    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
+  }
+
+  const body = { ok: true, src: unique.join(','), fetchedAt: Date.now(), rooms: [] };
+  unique.forEach((key, i) => {
+    if (!results[i].ok) return;
+    if (unique.length === 1) {
+      // single-source envelope stays byte-identical to the historic one (rainya 原样透传)
+      for (const row of results[i].rooms) body.rooms.push(row);
+      return;
+    }
+    // v6: in a combined answer every row must stay attributable → per-row `src`
+    for (const row of results[i].rooms) body.rooms.push({ ...row, src: key });
+  });
+  if (failed.length) body.errors = Object.fromEntries(failed.map((key) => [key, 'UPSTREAM']));
+  return { status: 200, body, cache: failed.length ? RELAY_CACHE_PARTIAL : RELAY_CACHE_FULL };
 }
 
 
