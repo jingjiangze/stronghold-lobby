@@ -65,9 +65,22 @@ async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, co
     calls.push({ url: String(url), options: options || {} });
     if (fetchImpl) return Promise.resolve(fetchImpl(String(url), options || {}));
     if (failFetch) return Promise.reject(new Error('offline'));
-    const relay = String(url).match(/^\/api\/community\?src=([a-z]+)$/);
+    const relay = String(url).match(/^\/api\/community\?src=([a-z,]+)$/);
     if (relay) {
-      return Promise.resolve(jsonRes({ ok: true, src: relay[1], fetchedAt: 0, rooms: community[relay[1]] || [] }));
+      // 合并形态（v6）：把每个源的 mock 行拼起来并逐行打 src；值写成 'error' 表示该源上游失败。
+      const keys = relay[1].split(',');
+      const rooms = [];
+      const errors = {};
+      for (const key of keys) {
+        if (community[key] === 'error') { errors[key] = 'UPSTREAM'; continue; }
+        for (const row of community[key] || []) rooms.push(Object.assign({}, row, { src: key }));
+      }
+      if (Object.keys(errors).length === keys.length) {
+        return Promise.resolve(jsonRes({ ok: false, error: 'UPSTREAM' }, 502));
+      }
+      const body = { ok: true, src: relay[1], fetchedAt: 0, rooms };
+      if (Object.keys(errors).length) body.errors = errors;
+      return Promise.resolve(jsonRes(body));
     }
     return Promise.resolve(jsonRes(payload));
   };
@@ -189,12 +202,32 @@ test('page: 数据来源 — 三社区源聚合、逐行来源标签、页脚标
   assert.match(html, /在线/);
   assert.match(els.status.textContent, /已连接 · 3 个房间/);
 
-  // 四个源都真的请求了：一间房牌 + 三条中转（src 白名单键，绝不带 URL）。
+  // v6：社区源**合并成一条**请求 —— 一间房牌 + 一次合并中转（36 → 12 请求/小时）。
   const urls = calls.map((c) => c.url);
   assert.ok(urls.includes('/api/rooms'), 'board polled');
-  for (const src of ['rainya', 'lunar', 'rinko']) {
-    assert.ok(urls.includes('/api/community?src=' + src), 'relay polled: ' + src);
-  }
+  assert.ok(urls.includes('/api/community?src=rainya,lunar,rinko'), 'one combined relay call');
+  assert.equal(urls.filter((u) => u.startsWith('/api/community')).length, 1, 'exactly one relay call');
+});
+
+test('page: 合并响应里归属不明的行会被丢弃（不会挂到错误的来源上）', async () => {
+  const { list } = await runPage(
+    { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [] },
+    {
+      fetch: (url, options) => {
+        if (String(url).startsWith('/api/community')) {
+          return jsonRes({ ok: true, src: 'rainya,lunar,rinko', fetchedAt: 0, rooms: [
+            { code: 'KKKK', server: 'raiya', ageSec: 5, url: 'https://game.rainya.me/?room=KKKK' },          // 无 src → 丢
+            { code: 'LMNP', server: 'Lunar', serverId: 'lunar', live: true, url: 'https://stronghold.lunar.ag/?room=LMNP', src: 'lunar' },
+          ] });
+        }
+        return jsonRes({ ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [] });
+      },
+    },
+  );
+  const html = list.innerHTML;
+  assert.ok(!html.includes('KKKK'), 'a row without src is dropped (never guessed)');
+  assert.match(html, /LMNP/);
+  assert.match(html, /title="房间来源：Lunar（stronghold\.lunar\.ag）">stronghold\.lunar\.ag</, "存活的行仍带正确的来源标签");
 });
 
 test('page: 数据来源 — 单源不可达只在来源标注里点名，不挡住别的源', async () => {
@@ -202,9 +235,10 @@ test('page: 数据来源 — 单源不可达只在来源标注里点名，不挡
     { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] },
     {
       fetch: (url, options) => {
-        if (String(url).includes('src=rainya')) return jsonRes({ ok: false, error: 'UPSTREAM' }, 502);
-        const relay = String(url).match(/src=([a-z]+)$/);
-        if (relay) return jsonRes({ ok: true, src: relay[1], fetchedAt: 0, rooms: [] });
+        // 合并调用里只有 raiya 上游失败 → 200 + errors，页面只把 raiya服 标灰。
+        if (String(url).startsWith('/api/community')) {
+          return jsonRes({ ok: true, src: 'rainya,lunar,rinko', fetchedAt: 0, rooms: [], errors: { rainya: 'UPSTREAM' } });
+        }
         return jsonRes({ ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] });
       },
     },
@@ -270,7 +304,7 @@ test('page: 后台标签页不发任何请求，回到前台立刻全量刷新�
 
   doc.hidden = false;
   await api.load();
-  assert.ok(calls.length >= 4, 'back to the foreground: one full refresh (board + three relays)');
+  assert.equal(calls.length, 2, 'one full refresh = board + one combined relay');
   assert.match(els.list.innerHTML, /AAAA/);
   assert.match(els.list.innerHTML, /KKKK/, "community rows come along on the refresh");
 });

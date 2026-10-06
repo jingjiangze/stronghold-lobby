@@ -530,10 +530,12 @@ export const PAGE_HTML = `<!doctype html>
   'use strict';
   // 房间牌 60s 一跳、社区源 300s —— **与 APK 面板同一档**（extras/public/js/lobby.js 的
   // BOARD_REFRESH_MS / COMMUNITY_REFRESH_MS）。额度账（免费额度：Workers 10 万请求/天）：
-  // 一个**可见**标签页每小时 = 60 次房间牌 + 3×12 次社区中转 = 96 次请求；
-  // 20s/180s 时代是 240 次（本次两轮拉长后降到 40%）；**后台**标签页两个定时器都不发请求（见下），
+  // 一个**可见**标签页每小时 = 60 次房间牌 + **12 次合并中转**（三源一次拉，v6）= **72 次请求**；
+  // 最初 20s/180s/三源分开的时代是 240 次。**后台**标签页两个定时器都不发请求（见下），
   // 服务端访客心跳另有 60s 写节流（board.js VISIT_WRITE_MIN_MS，已是 120s 计数窗口下能压到的极限）。
-  // 再往下压只剩「合并三源中转 / 拉长中转边缘缓存」两条，见 README。
+  // 再往下：wrangler.toml 的 [cache] enabled（Workers Cache）让本页 HTML（max-age=60）与合并中转
+  // （s-maxage=60）命中边缘缓存时**根本不触发这个 Worker** —— 并发访客共享同一次调用；
+  // /api/rooms 是 no-store，永远 BYPASS（房间牌必须实时，访客计数也依赖它每次都进 DO）。
   var POLL_MS = 60000;
   var COMMUNITY_POLL_MS = 300000;
   // v5.6 额度纪律：页面在后台标签页时两个定时器都不发请求（回到前台 visibilitychange 立刻全量刷新）。
@@ -891,6 +893,11 @@ export const PAGE_HTML = `<!doctype html>
   };
   var visitors = null;
 
+  /** 三源合并中转（v6）：一次请求拉全部社区源 —— 36 → 12 请求/小时/可见标签页。
+   *  响应里每行带 src；某个源挂了落在 errors，只有那个源变灰，其它源照常。 */
+  var COMMUNITY_KEYS = ['rainya', 'lunar', 'rinko'];
+  var COMMUNITY_URL = '/api/community?src=' + COMMUNITY_KEYS.join(',');
+
   function fetchBoard() {
     return fetch('/api/rooms', { headers: { accept: 'application/json' } })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
@@ -901,33 +908,52 @@ export const PAGE_HTML = `<!doctype html>
       });
   }
 
-  function fetchCommunity(key) {
-    return fetch('/api/community?src=' + key, { headers: { accept: 'application/json' } })
+  function fetchCommunityAll() {
+    return fetch(COMMUNITY_URL, { headers: { accept: 'application/json' } })
       .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
       .then(function (data) {
-        if (!data || data.ok !== true || data.src !== key || !Array.isArray(data.rooms)) throw new Error('relay payload');
-        sources[key] = { state: 'ok', at: Date.now(), list: data.rooms.map(function (r) { return shapeRoom(r, key); }).filter(Boolean) };
+        if (!data || data.ok !== true || !Array.isArray(data.rooms)) throw new Error('relay payload');
+        var at = Date.now();
+        var got = {};
+        COMMUNITY_KEYS.forEach(function (k) { got[k] = []; });
+        data.rooms.forEach(function (r) {
+          var key = String((r && r.src) || '');
+          if (COMMUNITY_KEYS.indexOf(key) < 0) return;          // 归属不明的行直接丢（合并响应必带 src）
+          got[key].push(shapeRoom(r, key));
+        });
+        var errors = (data.errors && typeof data.errors === 'object') ? data.errors : {};
+        COMMUNITY_KEYS.forEach(function (k) {
+          if (errors[k]) { sources[k] = { state: 'error', at: at, list: [] }; return; }
+          sources[k] = { state: 'ok', at: at, list: got[k].filter(Boolean) };
+        });
       });
   }
 
-  function pull(key) {
-    var p = key === 'board' ? fetchBoard() : fetchCommunity(key);
-    return p.catch(function () { sources[key] = { state: 'error', at: Date.now(), list: [] }; });
+  /** 整个合并调用失败 → 三个社区源一起标记不可达（与旧的逐源失败语义一致）。 */
+  function pullCommunity() {
+    return fetchCommunityAll().catch(function () {
+      var at = Date.now();
+      COMMUNITY_KEYS.forEach(function (k) { sources[k] = { state: 'error', at: at, list: [] }; });
+    });
+  }
+
+  function pullBoard() {
+    return fetchBoard().catch(function () { sources.board = { state: 'error', at: Date.now(), list: [] }; });
   }
 
   /** 全量刷新（初次进入 / 提交房间后 / 回到前台）。 */
   function load() {
-    return Promise.all(SOURCE_ORDER.map(pull)).then(function () { render(); });
+    return Promise.all([pullBoard(), pullCommunity()]).then(function () { render(); });
   }
 
   function loadBoard() {
-    return pull('board').then(function () { render(); });
+    return pullBoard().then(function () { render(); });
   }
 
   /** 社区源一跳（后台标签页直接跳过 —— 省额度，见顶部 POLL_MS 注释）。 */
   function loadCommunity() {
     if (document.hidden) return Promise.resolve();
-    return Promise.all(['rainya', 'lunar', 'rinko'].map(pull)).then(function () { render(); });
+    return pullCommunity().then(function () { render(); });
   }
 
   // ---- 渲染 ---------------------------------------------------------------------------

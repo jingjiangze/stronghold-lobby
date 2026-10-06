@@ -118,7 +118,8 @@ test('src=rinko: occupied>=capacity without inMatch reports full', async () => {
 
 test('whitelist: missing/unknown/duplicate/extra params are 400 BAD_SRC with ZERO outbound calls', async () => {
   const log = stubFetch(async () => jsonResponse({}));
-  for (const query of ['', '?src=', '?src=nope', '?src=RAINYA', '?src=rainya&src=lunar', '?src=rainya&x=1', '?x=1']) {
+  for (const query of ['', '?src=', '?src=nope', '?src=RAINYA', '?src=rainya&src=lunar', '?src=rainya&x=1', '?x=1',
+                       '?src=rainya,nope', '?src=rainya,,nope', '?src=rainya,lunar,rinko,nope', '?src=,']) {
     const res = await callRelay(query);
     assert.equal(res.status, 400, `expected 400 for "${query}"`);
     const body = await res.json();
@@ -178,12 +179,82 @@ test('a timeout is a 502, not a hang', async () => {
   }
 });
 
-test('a successful relay response is edge-cacheable (public, max-age=10, s-maxage=10)', async () => {
+test('a successful relay response is edge-cacheable (public, max-age=10, s-maxage=60)', async () => {
   stubFetch(async () => jsonResponse({ rooms: [] }));
   const res = await callRelay('?src=rainya');
   assert.equal(res.status, 200);
-  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=10');
+  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=60');
   assert.equal(res.headers.get('access-control-allow-origin'), '*');
+});
+
+test('v6 combined: ?src=rainya,lunar answers once, tags every row with its own src', async () => {
+  const log = stubFetch(async (url) => {
+    if (url === 'https://game.rainya.me/api/rooms') {
+      return jsonResponse({ rooms: [{ code: 'XAER', server: '国内', leftSec: 120 }] });
+    }
+    if (url === 'https://stronghold.lunar.ag/api/rooms') {
+      return jsonResponse({ items: [{ roomId: 'lmnp', hostName: '阿米娅', occupied: 3, capacity: 4, inMatch: false }] });
+    }
+    throw new Error('unexpected ' + url);
+  });
+  const res = await callRelay('?src=rainya,lunar');
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.src, 'rainya,lunar', 'the envelope echoes the (deduped, ordered) list');
+  assert.equal(body.rooms.length, 2);
+  assert.equal(body.rooms[0].code, 'XAER');
+  assert.equal(body.rooms[0].src, 'rainya', 'rainya rows are tagged in the combined form');
+  assert.equal(body.rooms[1].code, 'LMNP');
+  assert.equal(body.rooms[1].src, 'lunar');
+  assert.equal(body.rooms[1].note, '房主：阿米娅');
+  assert.equal(body.errors, undefined, 'no failed source → no errors key');
+  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=60');
+  assert.deepEqual(log.map((c) => c.url).sort(), [
+    'https://game.rainya.me/api/rooms',
+    'https://stronghold.lunar.ag/api/rooms',
+  ], 'exactly the two requested upstreams, each once');
+});
+
+test('v6 combined: duplicate keys dedupe, order is preserved', async () => {
+  const log = stubFetch(async () => jsonResponse({ items: [] }));
+  const res = await callRelay('?src=lunar,lunar,rainya,lunar');
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.src, 'lunar,rainya');
+  assert.equal(log.length, 2, 'one call per unique source');
+});
+
+test('v6 combined: one failing source lands in errors and never fails the whole call', async () => {
+  stubFetch(async (url) => {
+    if (url === 'https://stronghold.lunar.ag/api/rooms') return jsonResponse({ error: 'nope' }, 500);
+    if (url === 'https://xn--rlr.rinko.ai/api/rooms') return jsonResponse({ items: [{ roomId: 'pqrs', hostName: '梨', occupied: 4, capacity: 4 }] });
+    return jsonResponse({ rooms: [{ code: 'XAER' }] });
+  });
+  const res = await callRelay('?src=rainya,lunar,rinko');
+  assert.equal(res.status, 200, 'partial success is still a 200');
+  const body = await res.json();
+  assert.deepEqual(body.errors, { lunar: 'UPSTREAM' });
+  assert.deepEqual(body.rooms.map((r) => [r.code, r.src]), [['XAER', 'rainya'], ['PQRS', 'rinko']]);
+  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=10',
+    'a partial answer keeps the short TTL so a recovered source is picked up quickly');
+});
+
+test('v6 combined: all sources failing is still a 502 no-store', async () => {
+  stubFetch(async () => jsonResponse({ error: 'boom' }, 500));
+  const res = await callRelay('?src=rainya,lunar,rinko');
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, 'UPSTREAM');
+  assert.equal(res.headers.get('cache-control'), 'no-store');
+});
+
+test('v6 single-source envelope stays byte-identical (rainya passthrough is untouched)', async () => {
+  const row = { code: 'XAER', siteId: 'shiyan', server: '国内', status: 'waiting', leftSec: 120 };
+  stubFetch(async () => jsonResponse({ rooms: [row] }));
+  const res = await callRelay('?src=rainya');
+  const body = await res.json();
+  assert.deepEqual(body.rooms, [row], 'no per-row src is added in the historic single form');
+  assert.equal(body.src, 'rainya');
 });
 
 test('all upstream constants themselves pass the deny-table check (self-consistency)', () => {
