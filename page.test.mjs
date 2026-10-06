@@ -154,7 +154,8 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
   assert.match(html, /5 分钟前/);   // EEEE, ageSec 300
 
   // Actions: 加入 for open rooms, 观战 for the in-match room, disabled 满员 for the full one.
-  assert.match(html, /class="btn btn--primary btn--sm" data-href="https:\/\/game\.example\.com\/\?room=AAAA"/);
+  // v7：加入目标以提交的那条链接为基准（/play 路径保留），不再被压成 origin
+  assert.match(html, /class="btn btn--primary btn--sm" data-href="https:\/\/game\.example\.com\/play\?room=AAAA"/);
   assert.match(html, /class="btn btn--amber btn--sm" data-href="https:\/\/stronghold\.lunar\.ag\/\?room=BBBB&amp;spectate=1"/);
   assert.match(html, /class="btn btn--sm" disabled><span class="btn__label">满员<\/span><\/button>/);
 
@@ -321,6 +322,35 @@ test('page: 轮询节奏守住额度下限（房间牌 60s、社区源 300s，�
   assert.equal(api.communityPollMs, 300000);
 });
 
+test('page: 换链接要跟着换服务器（自动填的会清掉，手填的不动）', async () => {
+  const payload = { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [
+    { code: 'AAAA', serverId: 'xiaolubao', serverName: '小鹿宝', url: 'https://xiaolubao.example.com/', ageSec: 5 },
+  ] };
+  const { els } = await runPage(payload);
+  const fire = (el, ev) => (el._handlers[ev] || []).forEach((fn) => fn({ key: 'x' }));
+  const urlEl = els['s-url'];
+  const serverEl = els['s-server'];
+
+  // 链接主机命中大厅里的已知服务器 → 自动补它的展示名
+  urlEl.value = 'https://xiaolubao.example.com/?room=abcd';
+  fire(urlEl, 'input');
+  assert.equal(serverEl.value, '小鹿宝');
+  assert.equal(els['s-code-echo'].textContent, 'ABCD');
+
+  // 换成一台没见过的服务器 → 自动填的名字要清掉（否则会挂到旧服务器的 id 上）
+  urlEl.value = 'https://unknown.example.com/?room=wxyz';
+  fire(urlEl, 'input');
+  assert.equal(serverEl.value, '', 'auto-filled name must be cleared when the host changes');
+  assert.equal(els['s-code-echo'].textContent, 'WXYZ');
+
+  // 用户手填过 → 换链接也不动它
+  serverEl.value = '我自己的服';
+  fire(serverEl, 'input');
+  urlEl.value = 'https://other.example.com/?room=abcd';
+  fire(urlEl, 'input');
+  assert.equal(serverEl.value, '我自己的服', 'a hand-typed server name is never touched');
+});
+
 test('page: empty board and offline state render explicit guidance', async () => {
   const empty = await runPage({ ok: true, now: 0, ttlSec: 600, visitors: 0, rooms: [] });
   assert.match(empty.list.innerHTML, /现在没有公开的房间/);
@@ -342,28 +372,44 @@ test('page: 提交房间面板默认折叠，且新增能力不需要放开 CSP'
 });
 
 test('page: 房间链接必填 —— 房号从链接读，服务器/难度/备注可选（先给中文提示）', async () => {
-  const { api } = await runPage({ ok: true, now: NOW, rooms: [] });
+  const { api, calls } = await runPage({ ok: true, now: NOW, rooms: [] });
+  const before = calls.length;
 
   // 房号输入归一仍用于「你把房号粘进了链接框」的识别
   assert.equal(api.normalizeCodeInput(' abi1q! '), 'ABQ');
 
+  // 无效输入一律 ok:false（Sourcery 🟡：只匹配 message 时，万一 ok 是 true 测试也会绿）
+  const reject = (input, re) => {
+    const r = api.buildPayload(input);
+    assert.equal(r.ok, false, 'must reject: ' + JSON.stringify(input));
+    assert.match(r.message, re);
+    return r.message;
+  };
   // ① 链接必填
-  assert.match(api.buildPayload({}).message, /请粘贴房间链接/);
-  assert.match(api.buildPayload({ url: '   ' }).message, /请粘贴房间链接/);
-  // ② 必须 https + 公网主机（与「加入」同一张 deny 表；只做静态校验，不发任何请求）
-  assert.match(api.buildPayload({ url: 'http://game.example.com/?room=ABCD' }).message, /https/);
-  assert.match(api.buildPayload({ url: 'https://127.0.0.1:3000/?room=ABCD' }).message, /https|公网/);
-  assert.match(api.buildPayload({ url: 'https://10.0.0.5/?room=ABCD' }).message, /https|公网/);
-  assert.match(api.buildPayload({ url: 'https://192.168.1.9/?room=ABCD' }).message, /https|公网/);
+  reject({}, /请粘贴房间链接/);
+  reject({ url: '   ' }, /请粘贴房间链接/);
+  // ② 必须 https + 公网主机（与「加入」同一张 deny 表）
+  reject({ url: 'http://game.example.com/?room=ABCD' }, /https/);
+  reject({ url: 'https://127.0.0.1:3000/?room=ABCD' }, /https|公网/);
+  reject({ url: 'https://10.0.0.5/?room=ABCD' }, /https|公网/);
+  reject({ url: 'https://192.168.1.9/?room=ABCD' }, /https|公网/);
+  reject({ url: 'https://[::1]/?room=ABCD' }, /https|公网/);
+  reject({ url: 'https://[fd00::1]/?room=ABCD' }, /https|公网/);
+  reject({ url: 'https://[fe80::1]/?room=ABCD' }, /https|公网/);
+  reject({ url: 'https://[::ffff:127.0.0.1]/?room=ABCD' }, /https|公网/);
   // ③ 链接里必须能读出房号：4 位、不含 I/O —— 不猜、不截断
-  assert.match(api.buildPayload({ url: 'https://game.example.com/' }).message, /没有房号/);
-  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=ABC' }).message, /没有房号/);
-  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=IOIO' }).message, /没有房号/);
-  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=ABCDE' }).message, /没有房号/);
+  reject({ url: 'https://game.example.com/' }, /没有房号/);
+  reject({ url: 'https://game.example.com/?room=ABC' }, /没有房号/);
+  reject({ url: 'https://game.example.com/?room=IOIO' }, /没有房号/);
+  reject({ url: 'https://game.example.com/?room=ABCDE' }, /没有房号/);
   // 把房号本身粘进了链接框 → 明确点名
-  assert.match(api.buildPayload({ url: 'abcd' }).message, /这是房号、不是链接/);
+  reject({ url: 'abcd' }, /这是房号、不是链接/);
   // ④ 过长链接
-  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=ABCD&x=' + 'y'.repeat(520) }).message, /过长/);
+  reject({ url: 'https://game.example.com/?room=ABCD&x=' + 'y'.repeat(520) }, /过长/);
+  // ⑤ 整套静态校验**一次请求都不发**（Sourcery 🟡：断言没盯 calls）
+  assert.equal(calls.length, before, 'validation must never touch the network');
+  assert.equal(calls.filter((c) => String(c.url).indexOf('/api/') === 0).length, before,
+    'no board/relay request from validation');
 
   // codeFromLink：严格取「?room=」参数（路径 / 其它参数 / fragment 都不影响）
   assert.equal(api.codeFromLink('https://game.example.com/play?room=abcd'), 'ABCD');
@@ -371,7 +417,12 @@ test('page: 房间链接必填 —— 房号从链接读，服务器/难度/备�
   assert.equal(api.codeFromLink('https://game.example.com/?room=IOIO'), '');
   assert.equal(api.codeFromLink('https://game.example.com/?room=AB'), '');
   assert.equal(api.codeFromLink('not-a-url'), '');
-  assert.equal(api.hostOf('https://Game.Example.com:8443/?room=ABCD'), 'game.example.com');
+  assert.equal(api.hostOf('https://Game.Example.com:8443/?room=ABCD'), 'game.example.com:8443');
+  assert.equal(api.originOf('https://Game.Example.com:8443/?room=ABCD'), 'https://game.example.com:8443');
+  // 全局可路由的 IPv6 照收（与服务端 board.js 同表）；私网/环回仍旧拒
+  assert.equal(api.safeHref('https://[2001:470:1f0b::1]/?room=ABCD'), 'https://[2001:470:1f0b::1]/?room=ABCD');
+  assert.equal(api.safeHref('https://[::1]/?room=ABCD'), '');
+  assert.equal(api.safeHref('https://[fc00::1]/?room=ABCD'), '');
 
   // ⑤ 正常载荷：链接必填 → payload 必带 url；服务器留空 = 用链接主机名兜底（服务端两个字段都必填）
   const ok = api.buildPayload({ url: 'https://game.example.com/play?room=abcd', note: '  来玩  ', difficulty: 'hard' });
@@ -384,6 +435,11 @@ test('page: 房间链接必填 —— 房号从链接读，服务器/难度/备�
   // ⑥ 手填服务器名（含 serverId）优先；保留字与超长照旧拦
   assert.deepEqual(plain(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', server: '小鹿宝', serverId: 'weishu' }).payload),
     { code: 'ABCD', serverId: 'weishu', serverName: '小鹿宝', url: 'https://x.example.com/?room=ABCD' });
+  // 同名不同端口 = 两台服务器：origin 匹配不能把 :8443 的链接算到默认端口那台头上
+  assert.equal(api.knownFrom([
+    { serverName: '小鹿宝', serverId: 's1', url: 'https://game.example.com/' },
+    { serverName: '小鹿宝', serverId: 's2', url: 'https://game.example.com:8443/' },
+  ]).length, 2, 'same name on a different port stays two servers');
   assert.match(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', server: 'local' }).message, /本机服务/);
   assert.match(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', server: 'x'.repeat(65) }).message, /过长/);
   assert.equal(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', note: '字'.repeat(60) }).payload.note.length, 40);
