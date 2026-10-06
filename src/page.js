@@ -172,6 +172,10 @@ export const PAGE_HTML = `<!doctype html>
     var tags = '<span class="tag srv">' + esc(r.serverName || r.serverId || '未知服务器') + '</span>';
     if (r.difficulty || r.difficultyName) tags += '<span class="tag">' + esc(r.difficultyName || DIFF_NAMES[r.difficulty] || r.difficulty) + '</span>';
     if (r.mode) tags += '<span class="tag">' + esc(r.mode) + '</span>';
+    // 人数行只在房主上报过容量时出现（未上报的旧条目显示 0/0 只会误导）。
+    var seats = cap > 0
+      ? '<div class="row3"><span>' + occ + '/' + cap + ' 人</span><span class="bar" style="flex:1"><i style="width:' + pct + '%"></i></span></div>'
+      : '';
     var btn = st === 'open'
       ? '<button class="btn join" data-href="' + esc(targetFor(r, false)) + '">加入</button>'
       : st === 'live'
@@ -180,7 +184,7 @@ export const PAGE_HTML = `<!doctype html>
     return '<div class="card">'
       + '<div class="row1"><span class="code">' + esc(r.code || '????') + '</span>' + badge + '</div>'
       + '<div class="row2">' + tags + '</div>'
-      + '<div class="row3"><span>' + occ + '/' + cap + ' 人</span><span class="bar" style="flex:1"><i style="width:' + pct + '%"></i></span></div>'
+      + seats
       + (r.note ? '<div class="note">' + esc(r.note) + '</div>' : '')
       + '<div class="row4"><span class="ago">' + esc(ago(Number(r.createdAt))) + '</span>' + btn + '</div>'
       + '</div>';

@@ -60,9 +60,13 @@ const ROOM_HOSTILE = {
   note: '<img src=x onerror=alert(1)>', createdAt: 1_751_000_300_000,
   url: 'http://127.0.0.1:3000/steal',
 };
+const ROOM_NOSEAT = {
+  code: 'EEEE', serverId: 's5', serverName: '老条目服',
+  createdAt: 1_750_999_000_000, url: 'https://game.example.com/',
+};
 
 test('page: renders joinable first, 观战 for in-match, disabled 满员, escaped notes', async () => {
-  const { list, els } = await runPage({ ok: true, now: 0, ttlSec: 600, visitors: 7, rooms: [ROOM_FULL, ROOM_LIVE, ROOM_OPEN, ROOM_HOSTILE] });
+  const { list, els } = await runPage({ ok: true, now: 0, ttlSec: 600, visitors: 7, rooms: [ROOM_FULL, ROOM_LIVE, ROOM_OPEN, ROOM_HOSTILE, ROOM_NOSEAT] });
 
   const html = list.innerHTML;
   // Ordering: joinable rooms first (newest first inside the group), then the playing room, then full.
@@ -83,11 +87,15 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.ok(!html.includes('<img'), 'no raw <img> from a note');
 
+  // Seat row only appears when capacity was reported — never a misleading "0/0 人".
+  assert.ok(!html.includes('0/0 人'), 'capacity-less room must not render a 0/0 seat row');
+  assert.match(html, /2\/4 人/, 'reported seats still render');
+
   // Hostile URL falls back to the official web entry — never the loopback link.
   assert.ok(!html.includes('127.0.0.1'), 'loopback URL must not survive');
   assert.match(html, /data-href="https:\/\/weishu\.jiangjiangze\.icu\/\?room=DDDD"/);
 
-  assert.match(els.status.textContent, /4 个房间/);
+  assert.match(els.status.textContent, /5 个房间/);
   assert.match(els.visitors.textContent, /大厅访客 7 人/);
 });
 
