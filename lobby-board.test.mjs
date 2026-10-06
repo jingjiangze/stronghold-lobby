@@ -696,6 +696,28 @@ test('adapter: /api/health and CORS headers on every response', async () => {
   assert.equal(method.body.error, 'METHOD_NOT_ALLOWED');
 });
 
+test('adapter: GET / serves the static lobby page (no env, no DO hop)', async () => {
+  for (const path of ['/', '/index.html']) {
+    const res = await worker.fetch(new Request(`https://board.example.test${path}`), {});
+    assert.equal(res.status, 200, `${path} must serve the page`);
+    assert.equal(res.headers.get('content-type'), 'text/html; charset=utf-8');
+    const html = await res.text();
+    assert.match(html, /联机大厅/, 'page carries the board title');
+    assert.match(html, /\/api\/rooms/, 'page polls the same-origin board API');
+    assert.match(html, /观战/, 'in-match rooms render a spectate action');
+    assert.match(html, /id="list"/, 'page mounts a room list container');
+    assert.match(html, /Content-Security-Policy/, 'page ships its own CSP');
+  }
+
+  // HEAD is served like GET; anything else is a 405. All of it must run with an EMPTY env object —
+  // this route is fully static and may never touch DO bindings.
+  const head = await worker.fetch(new Request('https://board.example.test/', { method: 'HEAD' }), {});
+  assert.equal(head.status, 200);
+  const post = await worker.fetch(new Request('https://board.example.test/', { method: 'POST' }), {});
+  assert.equal(post.status, 405);
+  assert.equal((await post.json()).error, 'METHOD_NOT_ALLOWED');
+});
+
 test('adapter: POST/GET/DELETE round-trip through the Durable Object + status mapping', async () => {
   const { env, storage } = fakeEnv();
 

@@ -7,6 +7,7 @@
 //
 // ROUTES
 //   OPTIONS *              CORS preflight (204)
+//   GET  /                 the public lobby page (src/page.js) — live room board, join/spectate
 //   GET  /api/rooms        rainya-shaped board: { ok, now, ttlSec:600, rooms:[...] }
 //   POST /api/rooms        JSON { code, serverId, serverName, note?, url?, difficulty? } -> 201 { ok, added, token }
 //   PATCH /api/rooms       JSON { code, serverId, note }  header X-Token      -> 200 { ok, updated }
@@ -27,6 +28,7 @@
 
 import { createBoard, targetHostDenyReason, CODE_RE, TTL_SEC } from './board.js';
 import { createMatch } from './match.js';
+import { PAGE_HTML } from './page.js';
 
 /** The single DO instance name — one board for every caller (singleton semantics). */
 const BOARD_OBJECT_NAME = 'board';
@@ -356,6 +358,19 @@ export default {
     const method = (request.method || 'GET').toUpperCase();
     try {
       if (method === 'OPTIONS') return withCors(new Response(null, { status: 204 }));
+
+      if (url.pathname === '/' || url.pathname === '/index.html') {
+        if (method !== 'GET' && method !== 'HEAD') return withCors(json({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405));
+        // Static page: no env, no DO hop — live data arrives via the same-origin /api/rooms poll.
+        return new Response(PAGE_HTML, {
+          status: 200,
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'cache-control': 'public, max-age=60',
+            'x-content-type-options': 'nosniff',
+          },
+        });
+      }
 
       if (url.pathname === '/api/health') {
         if (method !== 'GET') return withCors(json({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405));

@@ -31,8 +31,9 @@ tools/apk/lobby-worker/
 ├── src/board.js            # 房间牌纯核心：校验 / 限流 / TTL / token（零依赖，node --test 直测）
 ├── src/match.js            # 跨服匹配队列纯核心：入队 / 成队 / 房号交接 / 取消（同风格零依赖）
 ├── src/index.js            # Worker 路由 + 两个 DO 类 Board / MatchQueue（薄适配层 + 粗粒度 alarm）
+├── src/page.js             # 前台网页（GET / 的整页 HTML/CSS/JS：实时房间牌 + 加入/观战，单文件零外链）
 ├── wrangler.toml           # name / DO 绑定 ×2 / migrations v1+v2（部署命令见文件注释）
-├── lobby-board.test.mjs    # node --test（内存适配器直测核心 + 适配层往返）
+├── lobby-board.test.mjs    # node --test（内存适配器直测核心 + 适配层往返 + GET / 静态页）
 ├── lobby-relay.test.mjs    # node --test（社区源中转：白名单/映射/超时/缓存头，脚本化上游）
 ├── match-queue.test.mjs    # node --test（队列：成队/房主选举/房号交接/取消/TTL/限流/上限）
 └── README.md               # 本文件
@@ -44,6 +45,7 @@ tools/apk/lobby-worker/
 
 | 方法 | 路径 | 请求 | 成功 | 说明 |
 | --- | --- | --- | --- | --- |
+| GET | `/` `/index.html` | — | `200 text/html` | **前台网页**（见下节）；`cache-control: public, max-age=60`；非 GET/HEAD → 405；纯静态，不碰 DO |
 | GET | `/api/rooms` | 可选头 `X-Device`（设备号） | `200 {ok,now,ttlSec,visitors,rooms[]}` | `now` 为 epoch 毫秒；只含未过期条目，最新在前。**v5.2**：同一次请求顺带记一个大厅访客（`X-Device` 优先、IP 兜底），`visitors` = 120s 窗口内去重访客数——零额外请求 |
 | POST | `/api/rooms` | JSON `{code, serverId, serverName, note?, url?, difficulty?, mode?, status?, occupied?, capacity?}` | `201 {ok:true, added, token}` | `token` = 128bit hex（32 字符），请客户端保存；**v5.2 直播字段**白名单化（非法值忽略，绝不因此拒绝提交） |
 | PATCH | `/api/rooms` | JSON `{code, serverId, note, mode?, status?, occupied?, capacity?}`，头 `X-Token: <token>` | `200 {ok:true, updated:{code,serverId,note,+直播字段}}` | 仅 token+serverId **完全匹配**才可编辑；`note` 缺省/空白 = 清空；**v5.2** 起可同时刷新直播字段（只覆盖本次带上者），`createdAt`/`url`/`token` 不动，**不刷新 TTL**、不新增限流桶 |
@@ -55,6 +57,16 @@ tools/apk/lobby-worker/
 | DELETE | `/api/match?id=<handle>` | 头 `X-Token` | `200 {ok,removed:'queue'\|'member'\|'match'}` | 退出队列 / 离开对局（房主离开则席位顺延；最后一人离开记录销毁） |
 | OPTIONS | `*` | — | `204` | CORS 预检 |
 | GET | `/api/health` | — | `200 {ok:true, now}` | 无状态上线自检 |
+
+## 前台网页（`GET /`）
+
+`https://sp-lobby.jiangjiangze.icu/` 直接打开的公开页面（`src/page.js`：单文件 HTML/CSS/JS、零外链、自带 CSP）：只做一件事——**最新的可加入房间排在最前，点一下就进场**。
+
+- 数据 = 同源 `GET /api/rooms`，20 s 轮询 + 切回标签页立即刷新；页面不直连任何第三方；
+- 排序：**可加入（开放）永远在最前**，组内最新在前；`status=playing` 的行给「观战」按钮（目标带 `?spectate=1`），满员行置灰仍展示；
+- 「加入」目标 = 卡片自己的 `url`（https + 公网主机校验，与服务端 `board.js` deny 表逐条对齐；不合法回落官方网页入口 `https://weishu.jiangjiangze.icu/`），拼 `?room=CODE`——与客户端深链同一约定；
+- 难度中文名 `标准/险境/绝境/终极`（与 APK 面板 `MATCH_DIFFS` 同表）；服务器名原样展示（不隐藏）；房间列表可滚动；
+- 页面是**被动只读视图**：只有 `GET /api/rooms` 一种请求，没有提交/编辑入口，不接受任何输入。
 
 房间条目（`rooms[i]` / `added`）：
 
