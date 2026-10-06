@@ -341,39 +341,54 @@ test('page: 提交房间面板默认折叠，且新增能力不需要放开 CSP'
   assert.ok(!/https?:\/\/[^"']*\.woff2/.test(PAGE_HTML), 'fonts are embedded, not linked');
 });
 
-test('page: 房号输入归一 + 提交载荷校验（与服务端同一套规则，先给中文提示）', async () => {
+test('page: 房间链接必填 —— 房号从链接读，服务器/难度/备注可选（先给中文提示）', async () => {
   const { api } = await runPage({ ok: true, now: NOW, rooms: [] });
 
-  // 房号：大写、剔除非法字母（I/O）、最多 4 位。
+  // 房号输入归一仍用于「你把房号粘进了链接框」的识别
   assert.equal(api.normalizeCodeInput(' abi1q! '), 'ABQ');
-  assert.equal(api.normalizeCodeInput('abcd'), 'ABCD');
 
-  // 缺服务器 / 保留字 / 非法地址 —— 本地先拦，服务端 BAD_* 也有对应中文文案。
-  assert.match(api.buildPayload({ code: 'ABCD' }).message, /服务器名/);
-  assert.match(api.buildPayload({ code: 'ABC', server: '站长服务' }).message, /4 位字母/);
-  assert.match(api.buildPayload({ code: 'ABCD', server: 'local' }).message, /本机服务/);
-  assert.match(api.buildPayload({ code: 'ABCD', server: '站长服务', serverId: 'AUTO' }).message, /本机服务/);
-  assert.match(api.buildPayload({ code: 'ABCD', server: '站长服务', url: 'http://game.example.com/' }).message, /https/);
-  assert.match(api.buildPayload({ code: 'ABCD', server: '站长服务', url: 'https://127.0.0.1:3000/' }).message, /https/);
-  assert.match(api.buildPayload({ code: 'ABCD', server: 'x'.repeat(65) }).message, /过长/);
+  // ① 链接必填
+  assert.match(api.buildPayload({}).message, /请粘贴房间链接/);
+  assert.match(api.buildPayload({ url: '   ' }).message, /请粘贴房间链接/);
+  // ② 必须 https + 公网主机（与「加入」同一张 deny 表；只做静态校验，不发任何请求）
+  assert.match(api.buildPayload({ url: 'http://game.example.com/?room=ABCD' }).message, /https/);
+  assert.match(api.buildPayload({ url: 'https://127.0.0.1:3000/?room=ABCD' }).message, /https|公网/);
+  assert.match(api.buildPayload({ url: 'https://10.0.0.5/?room=ABCD' }).message, /https|公网/);
+  assert.match(api.buildPayload({ url: 'https://192.168.1.9/?room=ABCD' }).message, /https|公网/);
+  // ③ 链接里必须能读出房号：4 位、不含 I/O —— 不猜、不截断
+  assert.match(api.buildPayload({ url: 'https://game.example.com/' }).message, /没有房号/);
+  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=ABC' }).message, /没有房号/);
+  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=IOIO' }).message, /没有房号/);
+  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=ABCDE' }).message, /没有房号/);
+  // 把房号本身粘进了链接框 → 明确点名
+  assert.match(api.buildPayload({ url: 'abcd' }).message, /这是房号、不是链接/);
+  // ④ 过长链接
+  assert.match(api.buildPayload({ url: 'https://game.example.com/?room=ABCD&x=' + 'y'.repeat(520) }).message, /过长/);
 
-  // 正常载荷：字段 trim、难度白名单大写、地址保留路径、备注截断到 40 码点。
-  const ok = api.buildPayload({
-    code: 'abcd', server: ' 站长服务 ', serverId: 'weishu', note: '  来玩  ',
-    difficulty: 'hard', url: 'https://weishu.jiangjiangze.icu/play',
-  });
+  // codeFromLink：严格取「?room=」参数（路径 / 其它参数 / fragment 都不影响）
+  assert.equal(api.codeFromLink('https://game.example.com/play?room=abcd'), 'ABCD');
+  assert.equal(api.codeFromLink('https://game.example.com/?x=1&room=WXYZ#frag'), 'WXYZ');
+  assert.equal(api.codeFromLink('https://game.example.com/?room=IOIO'), '');
+  assert.equal(api.codeFromLink('https://game.example.com/?room=AB'), '');
+  assert.equal(api.codeFromLink('not-a-url'), '');
+  assert.equal(api.hostOf('https://Game.Example.com:8443/?room=ABCD'), 'game.example.com');
+
+  // ⑤ 正常载荷：链接必填 → payload 必带 url；服务器留空 = 用链接主机名兜底（服务端两个字段都必填）
+  const ok = api.buildPayload({ url: 'https://game.example.com/play?room=abcd', note: '  来玩  ', difficulty: 'hard' });
   assert.equal(ok.ok, true);
   assert.deepEqual(plain(ok.payload), {
-    code: 'ABCD', serverId: 'weishu', serverName: '站长服务', note: '来玩',
-    difficulty: 'HARD', url: 'https://weishu.jiangjiangze.icu/play',
+    code: 'ABCD', serverId: 'game.example.com', serverName: 'game.example.com',
+    url: 'https://game.example.com/play?room=abcd', note: '来玩', difficulty: 'HARD',
   });
 
-  // serverId 缺省 = serverName（自有服务器 / 手填服务器名时）；难度白名单外的值静默丢弃。
-  assert.deepEqual(plain(api.buildPayload({ code: 'ABCD', server: '小鹿宝', difficulty: 'nope' }).payload),
-    { code: 'ABCD', serverId: '小鹿宝', serverName: '小鹿宝' });
-  assert.equal(api.buildPayload({ code: 'ABCD', server: '小鹿宝', note: '字'.repeat(60) }).payload.note.length, 40);
+  // ⑥ 手填服务器名（含 serverId）优先；保留字与超长照旧拦
+  assert.deepEqual(plain(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', server: '小鹿宝', serverId: 'weishu' }).payload),
+    { code: 'ABCD', serverId: 'weishu', serverName: '小鹿宝', url: 'https://x.example.com/?room=ABCD' });
+  assert.match(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', server: 'local' }).message, /本机服务/);
+  assert.match(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', server: 'x'.repeat(65) }).message, /过长/);
+  assert.equal(api.buildPayload({ url: 'https://x.example.com/?room=ABCD', note: '字'.repeat(60) }).payload.note.length, 40);
 
-  // 错误码 → 中文（服务端 message 是英文调试文案，展示层不用它）。
+  // ⑦ 错误码 → 中文（服务端文案不进展示层）
   assert.match(api.errorText('DEBOUNCED', 'code ABCD was submitted 3s ago; wait 30s'), /30 秒后再试/);
   assert.match(api.errorText('RATE_LIMITED'), /频繁/);
   assert.match(api.errorText('LIMIT_REACHED'), /上限/);
@@ -393,14 +408,18 @@ test('page: 提交房间 → POST /api/rooms + 存 token，刷新后行上带「
       : jsonRes(roomsAfter)),
   });
 
-  const res = await api.submitRoom({ code: 'abcd', server: '站长服务', serverId: 'weishu' });
+  const res = await api.submitRoom({ url: 'https://weishu.jiangjiangze.icu/?room=abcd', server: '站长服务', serverId: 'weishu' });
   assert.equal(res.ok, true);
   assert.match(res.text, /10 分钟内有效/);
 
   const post = calls.find((c) => c.options.method === 'POST');
   assert.equal(post.url, '/api/rooms');
   assert.equal(post.options.headers['content-type'], 'application/json');
-  assert.deepEqual(JSON.parse(post.options.body), { code: 'ABCD', serverId: 'weishu', serverName: '站长服务' });
+  // v7：码从链接读、链接原样带上（payload 里 url 必存在）
+  assert.deepEqual(JSON.parse(post.options.body), {
+    code: 'ABCD', serverId: 'weishu', serverName: '站长服务',
+    url: 'https://weishu.jiangjiangze.icu/?room=abcd',
+  });
 
   // 凭据落到本源 localStorage（token + serverId 双匹配所需），并带 10 分钟到期时间。
   const saved = JSON.parse(store.get('sp.lobby.mine'));
@@ -416,10 +435,13 @@ test('page: 提交房间 → POST /api/rooms + 存 token，刷新后行上带「
   assert.match(html, /data-act="destroy" data-code="ABCD"/);
   assert.match(html, /剩 10 分钟/, 'owned rooms show the remaining TTL, not "x 分钟前"');
 
-  // 校验失败不发请求（本地拦截）。
+  // 校验失败不发请求（本地拦截）：链接没有房号 / 干脆没给链接，两种都拦住。
   const before = calls.length;
-  const bad = await api.submitRoom({ code: 'AB', server: '站长服务' });
+  const bad = await api.submitRoom({ url: 'https://weishu.jiangjiangze.icu/' });
   assert.equal(bad.ok, false);
+  assert.match(bad.text, /没有房号/);
+  const none = await api.submitRoom({});
+  assert.equal(none.ok, false);
   assert.equal(calls.length, before, 'invalid input never reaches the board');
 });
 

@@ -325,6 +325,15 @@ export const PAGE_HTML = `<!doctype html>
   .room__ago{font-size:.12rem; letter-spacing:.04em; color:var(--text-dim); white-space:nowrap}
   .room__acts{display:flex; align-items:center; gap:.08rem; margin-left:auto; flex-wrap:wrap}
   .noteedit{display:flex; align-items:center; gap:.08rem; flex-wrap:wrap}
+  /* 房号回显（从链接识别的结果）：只读，不占输入框 */
+  .code-echo{
+    display:flex; align-items:center; min-height:.34rem; padding:0 .1rem;
+    border:1px dashed var(--line-2); background:rgba(10,13,12,.5);
+    font-family:var(--font-num); font-size:.16rem; letter-spacing:.18em; color:var(--text-lo);
+  }
+  .code-echo.is-idle{font-family:var(--font-cjk); font-size:.12rem; letter-spacing:.02em; color:var(--text-dim)}
+  .code-echo.is-ok{color:var(--mint-400); border-color:var(--mint-a35); border-style:solid}
+  .code-echo.is-bad{font-family:var(--font-cjk); font-size:.12rem; letter-spacing:.02em; color:var(--amber); border-color:rgba(246,163,41,.45)}
 
   /* ---- 状态块 / 转轮 ---- */
   .lobby-state{border:1px dashed var(--line-2); padding:.32rem .18rem; text-align:center;
@@ -475,10 +484,12 @@ export const PAGE_HTML = `<!doctype html>
 
       <section class="lobby-submit" id="submit" hidden>
         <div class="admin-grid">
-          <label class="admin-field"><span class="micro">房号</span>
-            <input id="s-code" maxlength="4" inputmode="latin" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD" /></label>
-          <label class="admin-field"><span class="micro">服务器</span>
-            <input id="s-server" list="s-servers" maxlength="64" autocomplete="off" spellcheck="false" placeholder="站长服务" /></label>
+          <label class="admin-field sf--wide"><span class="micro">房间链接（必填 · 要带邀请码）</span>
+            <input id="s-url" maxlength="512" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://服务器/?room=ABCD" /></label>
+          <div class="admin-field"><span class="micro">房号（从链接识别）</span>
+            <span class="code-echo is-idle" id="s-code-echo">粘贴链接后自动识别</span></div>
+          <label class="admin-field"><span class="micro">服务器（选填 · 默认取链接主机名）</span>
+            <input id="s-server" list="s-servers" maxlength="64" autocomplete="off" spellcheck="false" placeholder="留空 = 用链接主机名" /></label>
           <label class="admin-field"><span class="micro">难度（选填）</span>
             <select id="s-diff">
               <option value="">不填</option>
@@ -489,8 +500,6 @@ export const PAGE_HTML = `<!doctype html>
             </select></label>
           <label class="admin-field"><span class="micro">备注（选填）</span>
             <input id="s-note" maxlength="40" autocomplete="off" placeholder="≤40 字，所有人可见" /></label>
-          <label class="admin-field sf--wide"><span class="micro">房间地址（选填）</span>
-            <input id="s-url" maxlength="512" autocomplete="off" spellcheck="false" placeholder="https://…/  留空则「加入」跳官方网页入口" /></label>
         </div>
         <datalist id="s-servers"></datalist>
         <div class="admin-actions">
@@ -498,9 +507,9 @@ export const PAGE_HTML = `<!doctype html>
           <span class="admin-state" id="s-state"></span>
         </div>
         <div class="lobby-hint">
-          提交后 <b>10 分钟</b>内有效，期间可在自己的房间行上改备注 / 销毁。请确认房号真实可加入 ——
-          服务器名从列表里选（大厅里出现的服务器会自动出现在候选里），填了房间地址「加入」按钮才会跳到那台服务器，
-          留空则跳官方网页入口。
+          <b>把房间链接粘进来就行</b>（形如 <span class="num">https://服务器/?room=ABCD</span>）——
+          房号与主机都从链接里读，服务器 / 难度 / 备注都可选。提交后 <b>10 分钟</b>内有效，
+          期间可在自己的房间行上改备注 / 销毁；「加入」按钮直接跳这条链接，请确认它是别人点得开的地址。
         </div>
       </section>
 
@@ -752,6 +761,25 @@ export const PAGE_HTML = `<!doctype html>
   }
 
   /**
+   * 从房间链接里读房号（v7）：只认客户端邀请链接的约定「?room=ABCD」（生态里 weishu / rainya / lunar
+   * 的房间链接都是这个形状）。必须**本身就是干净的 4 位**（不含 I/O）—— 不猜、不截断：
+   * 「?room=ABCDE」「?room=IOIO」/ 没有 room 参数都返回 ''，交给上层给中文提示。
+   * @returns {string} 规范房号，或 ''
+   */
+  function codeFromLink(href) {
+    var u;
+    try { u = new URL(String(href || '')); } catch (e) { return ''; }
+    var raw = '';
+    try { raw = String(u.searchParams.get('room') || '').trim().toUpperCase(); } catch (e) { return ''; }
+    return CODE_RE.test(raw) ? raw : '';
+  }
+
+  /** 链接主机（服务器名留空时的兜底：服务端要求 serverId/serverName 非空）。 */
+  function hostOf(href) {
+    try { return new URL(String(href || '')).hostname.toLowerCase(); } catch (e) { return ''; }
+  }
+
+  /**
    * 服务端错误码 → 中文提示（服务端 message 是英文调试文案，展示层不用它）。
    */
   function errorText(code, fallback, status) {
@@ -770,23 +798,41 @@ export const PAGE_HTML = `<!doctype html>
   }
 
   /**
-   * 表单值 → POST /api/rooms 载荷，字段校验与服务端同一套规则（本地先拦一道给中文提示）。
+   * 表单值 → POST /api/rooms 载荷（v7：**链接必填**、房号从链接读、其余可选）。
+   * 字段校验与服务端同一套规则（本地先拦一道给中文提示）。
+   *  - 链接必须 https + 公网主机（与「加入」同一张 deny 表，不发任何请求、只做静态校验）；
+   *  - 房号必须能从链接的「?room=」里读出（4 位、不含 I/O）；
+   *  - 服务器名留空时用链接主机兜底（服务端 serverId/serverName 是必填，不能空）。
    * @returns {{ok:true, payload:object} | {ok:false, message:string}}
    */
   function buildPayload(values) {
     var v = values || {};
-    var code = normalizeCodeInput(v.code);
-    if (code.length !== 4) return { ok: false, message: '房号必须是 4 位字母（不含 I / O）' };
+    var raw = String(v.url || '').trim();
+    if (!raw) return { ok: false, message: '请粘贴房间链接（形如 https://服务器/?room=房号）' };
+    // 整串恰好是 4 位房号（把房号粘进了链接框）→ 先点名，比「不是 https」更有帮助
+    var bare = raw.toUpperCase();
+    if (CODE_RE.test(bare)) {
+      return { ok: false, message: '这是房号、不是链接：请粘贴它所在的房间链接（https://…/?room=' + bare + '）' };
+    }
+    var href = safeHref(raw);
+    if (!href) return { ok: false, message: '房间地址需为 https 公网地址（内网 / 环回 / http 都不行）' };
+    if (href.length > 512) return { ok: false, message: '房间地址过长（≤512 字）' };
+
+    var code = codeFromLink(href);
+    if (!code) {
+      return { ok: false, message: '链接里没有房号：需要形如 https://服务器/?room=ABCD（4 位字母，不含 I / O）' };
+    }
 
     var server = String(v.server || '').trim();
-    if (!server) return { ok: false, message: '请填写房间所在的服务器名' };
     if (Array.from(server).length > 64) return { ok: false, message: '服务器名过长（≤64 字）' };
-    var serverId = String(v.serverId || server).trim() || server;
-    if (RESERVED_SERVERS[server.toLowerCase()] || RESERVED_SERVERS[serverId.toLowerCase()]) {
+    var host = hostOf(href);
+    var serverName = server || host;
+    var serverId = String(v.serverId || '').trim() || serverName;
+    if (RESERVED_SERVERS[serverName.toLowerCase()] || RESERVED_SERVERS[serverId.toLowerCase()]) {
       return { ok: false, message: '本机服务 / 自动 不是公开服务器，无法提交' };
     }
 
-    var payload = { code: code, serverId: serverId, serverName: server };
+    var payload = { code: code, serverId: serverId, serverName: serverName, url: href };
 
     var note = String(v.note || '').trim();
     if (note) payload.note = Array.from(note).slice(0, NOTE_MAX).join('');
@@ -794,15 +840,6 @@ export const PAGE_HTML = `<!doctype html>
     var diff = String(v.difficulty || '').trim().toUpperCase();
     if (DIFF_ORDER.indexOf(diff) >= 0) payload.difficulty = diff;
 
-    var raw = String(v.url || '').trim();
-    if (raw) {
-      var href = safeHref(raw);
-      // 服务端也接受 http，但网页「加入」只跳 https（safeOrigin 拒绝 http）—— 提交 http 会让
-      // 别人点了回落到官方入口，所以这里直接拦掉并说明。
-      if (!href) return { ok: false, message: '房间地址需为 https 公网地址（可留空）' };
-      if (href.length > 512) return { ok: false, message: '房间地址过长（≤512 字）' };
-      payload.url = href;
-    }
     return { ok: true, payload: payload };
   }
 
@@ -961,7 +998,7 @@ export const PAGE_HTML = `<!doctype html>
   var noteEdit = null;     // 正在改备注的房号
   var actText = '';        // 房间行动作的就地提示（销毁 / 改备注）
   var known = [];          // 已知服务器（从房间牌推导：名称 → id / 主机）
-  var urlAuto = '';        // 地址栏是否由「选服务器」自动填的（用户手改过就不再覆盖）
+  var serverAuto = '';     // 服务器名是否由「链接主机」自动填的（用户手改过就不再覆盖）
   var last = null;         // 最近一次合并后的房间行（备注编辑器就地重绘用）
 
   function sourceTag(srcKey) {
@@ -1038,7 +1075,7 @@ export const PAGE_HTML = `<!doctype html>
   var panel = document.getElementById('submit');
   var panelBtn = document.getElementById('open-submit');
   var serversEl = document.getElementById('s-servers');
-  var codeEl = document.getElementById('s-code');
+  var codeEchoEl = document.getElementById('s-code-echo');
   var serverEl = document.getElementById('s-server');
   var urlEl = document.getElementById('s-url');
   var noteEl = document.getElementById('s-note');
@@ -1046,6 +1083,30 @@ export const PAGE_HTML = `<!doctype html>
   var goEl = document.getElementById('s-go');
   var srcStateEl = document.getElementById('src-state');
   var nextAt = 0;
+
+  /** 房号回显：把「从链接识别到什么」实时写出来（只读，不参与提交）。 */
+  function syncCodeEcho() {
+    if (!codeEchoEl) return;
+    var raw = urlEl ? String(urlEl.value || '').trim() : '';
+    if (!raw) { codeEchoEl.textContent = '粘贴链接后自动识别'; codeEchoEl.className = 'code-echo is-idle'; return; }
+    var href = safeHref(raw);
+    if (!href) { codeEchoEl.textContent = '地址需为 https 公网链接'; codeEchoEl.className = 'code-echo is-bad'; return; }
+    var code = codeFromLink(href);
+    if (!code) { codeEchoEl.textContent = '链接里没有 ?room= 房号'; codeEchoEl.className = 'code-echo is-bad'; return; }
+    codeEchoEl.textContent = code;
+    codeEchoEl.className = 'code-echo is-ok';
+  }
+
+  /** 按链接主机匹配大厅里已知的服务器（用于自动补服务器名 / 用它的正式 id）。 */
+  function knownByHost(host) {
+    if (!host) return null;
+    for (var i = 0; i < known.length; i++) {
+      if (safeOrigin(known[i].origin)) {
+        try { if (new URL(known[i].origin).hostname.toLowerCase() === host) return known[i]; } catch (e) { /* ignore */ }
+      }
+    }
+    return null;
+  }
 
   /** 从房间牌推导已知服务器（同一台服务器的房间共享主机）。 */
   function knownFrom(rooms) {
@@ -1163,25 +1224,30 @@ export const PAGE_HTML = `<!doctype html>
 
   function submitFromForm() {
     var values = {
-      code: codeEl ? codeEl.value : '',
       server: serverEl ? serverEl.value : '',
       serverId: '',
       note: noteEl ? noteEl.value : '',
       difficulty: diffEl ? diffEl.value : '',
       url: urlEl ? urlEl.value : '',
     };
-    var hit = knownFor(values.server);
-    if (hit && hit.id) values.serverId = hit.id; // 选自动推导的服务器 → 用它的正式 id
+    // 服务器名：手填的优先；留空时按链接主机找大厅里的已知服务器（用它的正式 id + 展示名），
+    // 再不行就让 buildPayload 用主机名兜底（服务端 serverId/serverName 必填）。
+    var href = safeHref(values.url);
+    var host = href ? hostOf(href) : '';
+    var hit = knownFor(values.server) || (!values.server ? knownByHost(host) : null);
+    if (!values.server && hit) values.server = hit.name;
+    if (hit && hit.id) values.serverId = hit.id;
     if (goEl) goEl.disabled = true;
     setState('提交中…', '');
     submitRoom(values).then(function (r) {
       if (goEl) goEl.disabled = false;
       setState(r.text, r.ok ? 'ok' : 'err');
       if (r.ok) {
-        if (codeEl) codeEl.value = '';
         if (noteEl) noteEl.value = '';
         if (urlEl) urlEl.value = '';
-        urlAuto = '';
+        if (serverEl) serverEl.value = '';
+        serverAuto = '';
+        syncCodeEcho();
         load();
       }
     });
@@ -1196,22 +1262,23 @@ export const PAGE_HTML = `<!doctype html>
       if (open) setState('', '');
     });
   }
-  if (codeEl) {
-    codeEl.addEventListener('input', function () { codeEl.value = normalizeCodeInput(codeEl.value); });
-    codeEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitFromForm(); });
-  }
-  if (serverEl) {
-    var onServer = function () {
-      var hit = knownFor(serverEl.value);
-      if (hit && hit.origin && urlEl && (!urlEl.value || urlEl.value === urlAuto)) {
-        urlEl.value = hit.origin;
-        urlAuto = hit.origin;
+  if (urlEl) {
+    // v7：链接是唯一必填项 —— 输入时实时回显房号，并按主机名自动补服务器（用户手改过就不再覆盖）。
+    var onUrl = function () {
+      syncCodeEcho();
+      if (!serverEl) return;
+      var href = safeHref(urlEl.value);
+      var hit = href ? knownByHost(hostOf(href)) : null;
+      if (hit && (!serverEl.value || serverEl.value === serverAuto)) {
+        serverEl.value = hit.name;
+        serverAuto = hit.name;
       }
     };
-    serverEl.addEventListener('input', onServer);
-    serverEl.addEventListener('change', onServer);
+    urlEl.addEventListener('input', onUrl);
+    urlEl.addEventListener('change', onUrl);
+    urlEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitFromForm(); });
   }
-  if (urlEl) urlEl.addEventListener('input', function () { urlAuto = ''; });
+  if (serverEl) serverEl.addEventListener('input', function () { serverAuto = ''; });
   if (noteEl) noteEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') submitFromForm(); });
   if (goEl) goEl.addEventListener('click', submitFromForm);
 
@@ -1225,6 +1292,7 @@ export const PAGE_HTML = `<!doctype html>
   // 测试面：纯函数与房间牌动作（页面本身只用 DOM 事件驱动它们）。
   window.__SP_PAGE = {
     safeHref: safeHref, safeOrigin: safeOrigin, normalizeCodeInput: normalizeCodeInput,
+    codeFromLink: codeFromLink, hostOf: hostOf,
     buildPayload: buildPayload, errorText: errorText, knownFrom: knownFrom,
     shapeRoom: shapeRoom, mergeRooms: mergeRooms, sortRooms: sortRooms, stateOf: stateOf, ageSecOf: ageSecOf,
     submitRoom: submitRoom, destroyRoom: destroyRoom, saveNote: saveNote,
