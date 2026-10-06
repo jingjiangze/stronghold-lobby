@@ -11,15 +11,15 @@
 //   rainya — game.rainya.me        ┐
 //   lunar  — stronghold.lunar.ag   ├ read-only community stations, relayed by GET /api/community
 //   rinko  — 卫.rinko.ai (梨子湖)  ┘ (their upstreams send no CORS headers; the relay is the door)
-// The board polls every 30 s; the community relay is pulled every 180 s (it is edge-cached 10 s
-// and its upstreams are quota-limited). Both timers stay silent while the tab is hidden — a page
-// parked in a background tab must not burn the Workers/DO free tier (see src/board.js
-// VISIT_WRITE_MIN_MS for the matching server-side write throttle). Rows carry a source tag so
-// every room states where it came from; joinable rooms get a 加入 button, in-match rooms get
-// 观战 (the client auto-spectates on `?room=CODE&spectate=1` — client patch v5.6). Outbound
-// navigation is limited to https URLs on public hosts (the same scheme/deny-table spirit as the
-// server's targetHostDenyReason), so a hostile card can never point the page at loopback/private
-// space.
+// The board polls every 60 s and the community relay every 300 s — the same cadence as the app's
+// lobby panel (its BOARD_REFRESH_MS / COMMUNITY_REFRESH_MS), which is the quota discipline for the
+// free tier: one visible tab costs 96 Worker requests an hour (60 board + 36 relay) and at most
+// 60 DO row writes (the server-side heartbeat throttle). Both timers stay silent while the tab is
+// hidden. Rows carry a source tag so every room states where it came from; joinable rooms get a
+// 加入 button, in-match rooms get 观战 (the client auto-spectates on `?room=CODE&spectate=1` —
+// client patch v5.6). Outbound navigation is limited to https URLs on public hosts (the same
+// scheme/deny-table spirit as the server's targetHostDenyReason), so a hostile card can never point
+// the page at loopback/private space.
 //
 // 提交房间 (v0.2): a visitor can publish their own room to the board (POST /api/rooms, the same
 // endpoint the app's panel uses) and, while its 10-minute TTL lasts, edit the note (PATCH) or
@@ -528,11 +528,15 @@ export const PAGE_HTML = `<!doctype html>
 <script>
 (function () {
   'use strict';
-  // 房间牌 30s 一跳；社区源 180s —— 中转本身有 10s 边缘缓存、上游有额度，别按房间牌的节奏拉。
-  // v5.6 额度纪律：**页面在后台标签页时两个定时器都不发请求**（回来时 visibilitychange 立刻全量刷新），
-  // 服务端的访客心跳也做了 60s 写节流 —— 一个挂着不管的标签页不再按整点烧 DO 的行写额度。
-  var POLL_MS = 30000;
-  var COMMUNITY_POLL_MS = 180000;
+  // 房间牌 60s 一跳、社区源 300s —— **与 APK 面板同一档**（extras/public/js/lobby.js 的
+  // BOARD_REFRESH_MS / COMMUNITY_REFRESH_MS）。额度账（免费额度：Workers 10 万请求/天）：
+  // 一个**可见**标签页每小时 = 60 次房间牌 + 3×12 次社区中转 = 96 次请求；
+  // 20s/180s 时代是 240 次（本次两轮拉长后降到 40%）；**后台**标签页两个定时器都不发请求（见下），
+  // 服务端访客心跳另有 60s 写节流（board.js VISIT_WRITE_MIN_MS，已是 120s 计数窗口下能压到的极限）。
+  // 再往下压只剩「合并三源中转 / 拉长中转边缘缓存」两条，见 README。
+  var POLL_MS = 60000;
+  var COMMUNITY_POLL_MS = 300000;
+  // v5.6 额度纪律：页面在后台标签页时两个定时器都不发请求（回到前台 visibilitychange 立刻全量刷新）。
   // 默认加入目标：官方网页入口（房间行未携带自己的 url、或提交时未填房间地址时使用）。
   var DEFAULT_CLIENT = 'https://weishu.jiangjiangze.icu/';
   // 本机凭据（提交房间返回的 token）：只在本源 localStorage 里，除了交回房间牌不作他用。
@@ -1199,6 +1203,7 @@ export const PAGE_HTML = `<!doctype html>
     shapeRoom: shapeRoom, mergeRooms: mergeRooms, sortRooms: sortRooms, stateOf: stateOf, ageSecOf: ageSecOf,
     submitRoom: submitRoom, destroyRoom: destroyRoom, saveNote: saveNote,
     readMine: readMine, load: load, sources: function () { return sources; },
+    pollMs: POLL_MS, communityPollMs: COMMUNITY_POLL_MS,   // 额度纪律：测试锁住下限（见 page.test.mjs）
   };
 })();
 </script>
