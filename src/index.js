@@ -150,29 +150,40 @@ const RELAY_CACHE_FULL = 'public, max-age=10, s-maxage=60';
 const RELAY_CACHE_PARTIAL = 'public, max-age=10, s-maxage=10';
 /** Max sources in one combined call (there are only three; the cap keeps the URL grammar tight). */
 const RELAY_SRC_MAX = 3;
+/** The whitelist order — the ONLY order a combined `src` list may use (canonical form). */
+const SOURCE_ORDER = Object.keys(COMMUNITY_SOURCES);
 
 /**
  * Relay the community sources named by `srcParam` (one key, or a comma list of 1..3 whitelist keys).
  *   ?src=lunar          → the historic single-source envelope（形状不变）
  *   ?src=rainya,lunar   → { ok, src:'rainya,lunar', fetchedAt, rooms:[{...,src:'rainya'|'lunar'}],
  *                           errors?: { <key>: 'UPSTREAM' } } — 一个源挂了不拖垮整次调用；三个全挂才 502。
+ * 列表必须是**规范拼写**：白名单顺序、无重复、无空条目、无空白 —— 同一组源只有一种 URL，
+ * 缓存键唯一（否则等价拼写可以绕开边缘缓存、把上游请求放大 N 倍）。
  * Returns { status, body, cache } — the caller attaches CORS.
  */
 async function relayCommunity(srcParam, env) {
-  const keys = String(srcParam == null ? '' : srcParam)
-    .split(',')
-    .map((k) => k.trim())
-    .filter((k) => k !== '');
-  const unique = [];
+  const raw = String(srcParam == null ? '' : srcParam);
+  const keys = raw === '' ? [] : raw.split(',');
+  if (keys.length === 0 || keys.length > RELAY_SRC_MAX) {
+    return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };
+  }
+  if (keys.some((key) => key === '')) {
+    return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };   // "a,,b" / 尾随逗号
+  }
+  if (new Set(keys).size !== keys.length) {
+    return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };   // 重复键
+  }
   for (const key of keys) {
     if (!Object.prototype.hasOwnProperty.call(COMMUNITY_SOURCES, key)) {
       return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };
     }
-    if (!unique.includes(key)) unique.push(key);
   }
-  if (unique.length === 0 || unique.length > RELAY_SRC_MAX) {
+  // 规范顺序（同时挡掉空白变体：'rainya, lunar' 的第二个键不在白名单里，先被上面拒绝）
+  if (SOURCE_ORDER.filter((key) => keys.includes(key)).join(',') !== keys.join(',')) {
     return { status: 400, body: { ok: false, error: 'BAD_SRC' }, cache: 'no-store' };
   }
+  const unique = keys;
 
   const results = await Promise.all(unique.map((key) => relayOne(key, env)));
   const failed = unique.filter((key, i) => !results[i].ok);
