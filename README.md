@@ -52,7 +52,7 @@ tools/apk/lobby-worker/
 | POST | `/api/rooms` | JSON `{code, serverId, serverName, note?, url?, difficulty?, mode?, status?, occupied?, capacity?}` | `201 {ok:true, added, token}` | `token` = 128bit hex（32 字符），请客户端保存；**v5.2 直播字段**白名单化（非法值忽略，绝不因此拒绝提交） |
 | PATCH | `/api/rooms` | JSON `{code, serverId, note, mode?, status?, occupied?, capacity?}`，头 `X-Token: <token>` | `200 {ok:true, updated:{code,serverId,note,+直播字段}}` | 仅 token+serverId **完全匹配**才可编辑；`note` 缺省/空白 = 清空；**v5.2** 起可同时刷新直播字段（只覆盖本次带上者），`createdAt`/`url`/`token` 不动，**不刷新 TTL**、不新增限流桶 |
 | DELETE | `/api/rooms?code=&serverId=` | 头 `X-Token: <token>` | `200 {ok:true, removed:{code,serverId}}` | 仅凭 token+serverId 匹配才可销毁 |
-| GET | `/api/community?src=rainya\|lunar\|rinko`（**v6：逗号列表 1..3 个**，如 `?src=rainya,lunar,rinko`） | — | `200 {ok,src,fetchedAt,rooms[]}`；合并形态逐行带 `src`，某源失败进 `errors:{key:'UPSTREAM'}`、只有全失败才 502 | **社区源中转**（三家上游都不发 CORS 头）。`src` 只认这三个白名单值（逗号列表去重后 ≤3）、不接受任何多余参数；完整成功的 200 带 `public, max-age=10, s-maxage=60`（部分失败退回 10），错误一律 `no-store`（防 CF 负缓存） |
+| GET | `/api/community?src=rainya\|lunar\|rinko`（**v6：逗号列表 1..3 个**，如 `?src=rainya,lunar,rinko`） | — | `200 {ok,src,fetchedAt,rooms[]}`；合并形态逐行带 `src`，某源失败进 `errors:{key:'UPSTREAM'}`、只有全失败才 502 | **社区源中转**（三家上游都不发 CORS 头）。`src` 只认这三个白名单值、不接受任何多余参数；逗号列表必须**规范拼写**（白名单顺序、无重复、无空条目、无空白，≤3 个）——同一组源只有一种 URL，缓存键唯一；完整成功的 200 带 `public, max-age=10, s-maxage=60`（部分失败退回 10），错误一律 `no-store`（防 CF 负缓存） |
 | GET | `/api/match?id=<handle>` | 可选头 `X-Token` | `200 {ok,state:'waiting',waiting,need,queuedSec}` 或 `{ok,state:'matched',role,matchId,room}` 或 `{ok,state:'expired'}` | 队列/对局状态轮询；`token` 不匹配 → 403 |
 | POST | `/api/match` | JSON `{difficulty, venue:{kind:'public'\|'local'\|'custom', serverId?}, app?}` | `201 {ok,state,token,id,…}` | 入队；同难度第 4 人立即 `state:'matched'`（响应同时带 `token` 与同一 `id`，客户端只存这一对句柄） |
 | POST | `/api/match/room` | JSON `{id, code, serverId, url?}`，头 `X-Token` | `200 {ok,room}` | **仅房主可发**；`url` 走与房间牌同一张公网 deny 表 |
@@ -158,7 +158,7 @@ node --test        # 全仓（board / relay / match / page）
 
 测试用内存适配器直测核心，并断言**全局 fetch 调用数为 0**（房间牌路由零出站；社区源中转走 lobby-relay.test.mjs 单独验证，仅允许三个常量上游）。覆盖：契约形状与 rainya 兼容字段、TTL/leftSec/过期清理、限流三条（IP 频次 / code 防抖 / IP 条目上限）、token 销毁（成功 / 错误 token / 不存在）、note 清洗与长度、备注编辑 PATCH（成功改备注 / 错误 token / 错误 serverId / 不存在或过期 / 不刷新 TTL / 其它字段不动）、保留字拦截（`sp-phone-host` / `local` / `auto`，含大小写与 trim 变体；相似 id 回归）、difficulty 白名单（`hard` → `HARD`；非法值静默忽略且提交成功）、url 校验（含 `127.0.0.1`、`10.0.0.1`、`[::1]`、`0x7f000001`、userinfo、超长 → 拒绝且不落盘）、适配层 CORS/状态码/DO 往返（含 PATCH 走 X-Token、PUT 405）。
 
-前台网页（`page.test.mjs`）把内联脚本放进 `node:vm` + DOM 桩里实跑，断言**四源聚合**（`/api/rooms` + 三条 `/api/community?src=…` 都被请求；单源 502 只在「数据来源」里点名、不挡别的源；同主机同房号去重且本站优先）与渲染（排序 / 来源标签 / 按钮 / 转义 / 恶意 URL 回落 / 断网态 / 空态引导），以及**提交房间**全链：房号归一、载荷校验（保留字 / 长度 / 私网地址 / 难度白名单 / 备注截断）、错误码→中文、`POST /api/rooms` 的请求形状与 token 落盘、刷新后行上带「我的」/改备注/销毁、`DELETE` 带 `X-Token`（含 `NOT_FOUND` 清凭据 / 过期凭据被剪枝）、`PATCH` 只动 note、已知服务器从房间牌推导。
+前台网页（`page.test.mjs`）把内联脚本放进 `node:vm` + DOM 桩里实跑，断言**四源聚合**（`/api/rooms` + **一条合并的** `/api/community?src=rainya,lunar,rinko`；200 响应里的 `errors` 只把失败的那个源标灰、不挡别的源；归属不明（缺 `src`）的行直接丢弃；同主机同房号去重且本站优先）与渲染（排序 / 来源标签 / 按钮 / 转义 / 恶意 URL 回落 / 断网态 / 空态引导），以及**提交房间**全链：房号归一、载荷校验（保留字 / 长度 / 私网地址 / 难度白名单 / 备注截断）、错误码→中文、`POST /api/rooms` 的请求形状与 token 落盘、刷新后行上带「我的」/改备注/销毁、`DELETE` 带 `X-Token`（含 `NOT_FOUND` 清凭据 / 过期凭据被剪枝）、`PATCH` 只动 note、已知服务器从房间牌推导。
 
 ## 部署
 

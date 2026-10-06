@@ -118,8 +118,12 @@ test('src=rinko: occupied>=capacity without inMatch reports full', async () => {
 
 test('whitelist: missing/unknown/duplicate/extra params are 400 BAD_SRC with ZERO outbound calls', async () => {
   const log = stubFetch(async () => jsonResponse({}));
-  for (const query of ['', '?src=', '?src=nope', '?src=RAINYA', '?src=rainya&src=lunar', '?src=rainya&x=1', '?x=1',
-                       '?src=rainya,nope', '?src=rainya,,nope', '?src=rainya,lunar,rinko,nope', '?src=,']) {
+  for (const query of ['', '?src=', '?src=nope', '?src=RAINYA', '?src=rainya&src=lunar', '?src=rainya&x=1', '?x=1', '?src=,',
+                       '?src=rainya,nope', '?src=rainya,,nope', '?src=rainya,lunar,rinko,nope',
+                       // 规范拼写约束（Sourcery 🟡）：空条目/重复/乱序/空白一律 400 ——
+                       // 同一组源只允许一种 URL，避免等价拼写绕开边缘缓存、把上游请求放大 N 倍。
+                       '?src=rainya,,lunar', '?src=rainya,lunar,', '?src=rainya,rainya', '?src=lunar,rainya',
+                       '?src=rainya,%20lunar', '?src=rainya,rinko,lunar']) {
     const res = await callRelay(query);
     assert.equal(res.status, 400, `expected 400 for "${query}"`);
     const body = await res.json();
@@ -216,13 +220,19 @@ test('v6 combined: ?src=rainya,lunar answers once, tags every row with its own s
   ], 'exactly the two requested upstreams, each once');
 });
 
-test('v6 combined: duplicate keys dedupe, order is preserved', async () => {
+test('v6 combined: only the canonical spelling is accepted (one cache key per source set)', async () => {
   const log = stubFetch(async () => jsonResponse({ items: [] }));
-  const res = await callRelay('?src=lunar,lunar,rainya,lunar');
-  assert.equal(res.status, 200);
-  const body = await res.json();
-  assert.equal(body.src, 'lunar,rainya');
-  assert.equal(log.length, 2, 'one call per unique source');
+  const ok = await callRelay('?src=rainya,lunar');
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).src, 'rainya,lunar');
+  assert.equal(log.length, 2, 'one upstream call per source in the list');
+
+  // 等价但非规范的拼写必须被拒（否则每个变体都是一条独立的缓存键 → 绕缓存 / 放大上游）
+  for (const bad of ['?src=lunar,rainya', '?src=rainya,rainya,lunar', '?src=rainya,,lunar']) {
+    const res = await callRelay(bad);
+    assert.equal(res.status, 400, `expected 400 for ${bad}`);
+  }
+  assert.equal(log.length, 2, 'rejected spellings never dial upstream');
 });
 
 test('v6 combined: one failing source lands in errors and never fails the whole call', async () => {
