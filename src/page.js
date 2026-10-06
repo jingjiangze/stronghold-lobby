@@ -621,7 +621,7 @@ export const PAGE_HTML = `<!doctype html>
       var open = panel.hidden;
       panel.hidden = !open;
       panelBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
-      panelBtn.textContent = open ? '收起提交' : '＋ 提交房间';
+      panelBtn.textContent = open ? '收起' : '＋ 提交房间';
       if (open) setState('', '');
     });
   }
