@@ -5,9 +5,13 @@
 // assert what actually lands in the room list: ordering, action buttons, escaping, hostile-URL
 // fallback and the offline state. This is the cheapest gate that would catch a broken renderer.
 //
-// 提交房间 (v0.2) is covered the same way: the page exposes its pure helpers + the three board
-// actions on `window.__SP_PAGE`, so the tests drive real requests through the stubbed fetch and
-// then assert on the re-rendered card (badge / 改备注 / 销毁) and on the localStorage token store.
+// 大厅数据来源 (v1.1): the page merges four sources — the local board (/api/rooms) plus the three
+// community stations relayed by /api/community?src=rainya|lunar|rinko. The harness routes fetches
+// per URL, so a test can make any single source fail or carry rooms and assert what the page does.
+//
+// 提交房间 (v0.2) is covered the same way: the page exposes its pure helpers + the board actions on
+// `window.__SP_PAGE`, so the tests drive real requests through the stubbed fetch and then assert on
+// the re-rendered room row (badges / 改备注 / 销毁) and on the localStorage token store.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -41,26 +45,30 @@ function plain(value) {
 }
 
 /**
- * Run the page script against a fixed /api/rooms payload.
+ * Run the page script against fixed source payloads.
  * @param {object} payload      GET /api/rooms body
  * @param {object} [opts]
  * @param {boolean} [opts.failFetch]  make every fetch reject
  * @param {(url:string, options:object) => object} [opts.fetch]  custom responder (records calls)
+ * @param {Record<string, object[]>} [opts.community]  rows per relayed community source
  * @param {object} [opts.seed]  initial localStorage contents
  * @returns {Promise<{list:object, els:object, api:object, calls:object[], store:Map<string,string>}>}
  */
-async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, seed = {} } = {}) {
+async function runPage(payload, { failFetch = false, fetch: fetchImpl = null, community = {}, seed = {} } = {}) {
   const script = PAGE_HTML.match(/<script>([\s\S]*?)<\/script>/)[1];
   const els = {};
   const el = (id) => (els[id] = els[id] || makeEl(id));
   const store = new Map(Object.entries(seed));
   const calls = [];
-  const boardResponder = () => (failFetch
-    ? Promise.reject(new Error('offline'))
-    : Promise.resolve(jsonRes(payload)));
   const fetchStub = (url, options) => {
     calls.push({ url: String(url), options: options || {} });
-    return Promise.resolve(fetchImpl ? fetchImpl(String(url), options || {}) : boardResponder());
+    if (fetchImpl) return Promise.resolve(fetchImpl(String(url), options || {}));
+    if (failFetch) return Promise.reject(new Error('offline'));
+    const relay = String(url).match(/^\/api\/community\?src=([a-z]+)$/);
+    if (relay) {
+      return Promise.resolve(jsonRes({ ok: true, src: relay[1], fetchedAt: 0, rooms: community[relay[1]] || [] }));
+    }
+    return Promise.resolve(jsonRes(payload));
   };
   const ctx = {
     document: {
@@ -109,6 +117,15 @@ const ROOM_NOSEAT = {
   code: 'EEEE', serverId: 's5', serverName: '老条目服', ageSec: 300, url: 'https://game.example.com/',
 };
 
+// 社区源行（中转归一后的形状）：rainya 是门户原样行，lunar/rinko 带 live + 人数。
+const COMMUNITY_RAINYA = {
+  code: 'KKKK', server: 'raiya', note: '门户房间', ageSec: 20, leftSec: 580, url: 'https://game.rainya.me/?room=KKKK',
+};
+const COMMUNITY_LUNAR = {
+  code: 'LLLL', server: 'Lunar', serverName: 'Lunar', serverId: 'lunar', occupied: 3, capacity: 4,
+  url: 'https://stronghold.lunar.ag/?room=LLLL', leftSec: 600, live: true, status: 'waiting', note: '房主：阿米娅',
+};
+
 test('page: renders joinable first, 观战 for in-match, disabled 满员, escaped notes', async () => {
   const { list, els } = await runPage({ ok: true, now: NOW, ttlSec: 600, visitors: 7, rooms: [ROOM_FULL, ROOM_LIVE, ROOM_OPEN, ROOM_HOSTILE, ROOM_NOSEAT] });
 
@@ -123,9 +140,9 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
   assert.match(html, /5 分钟前/);   // EEEE, ageSec 300
 
   // Actions: 加入 for open rooms, 观战 for the in-match room, disabled 满员 for the full one.
-  assert.match(html, /class="btn join" data-href="https:\/\/game\.example\.com\/\?room=AAAA"/);
-  assert.match(html, /class="btn watch" data-href="https:\/\/stronghold\.lunar\.ag\/\?room=BBBB&amp;spectate=1"/);
-  assert.match(html, /<button class="btn" disabled>满员<\/button>/);
+  assert.match(html, /class="btn btn--primary btn--sm" data-href="https:\/\/game\.example\.com\/\?room=AAAA"/);
+  assert.match(html, /class="btn btn--amber btn--sm" data-href="https:\/\/stronghold\.lunar\.ag\/\?room=BBBB&amp;spectate=1"/);
+  assert.match(html, /class="btn btn--sm" disabled><span class="btn__label">满员<\/span><\/button>/);
 
   // Server names are shown verbatim (never hidden); difficulty uses the panel's label table.
   assert.match(html, /raiya服/);
@@ -137,17 +154,107 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
 
   // Seat row only appears when capacity was reported — never a misleading "0/0 人".
   assert.ok(!html.includes('0/0 人'), 'capacity-less room must not render a 0/0 seat row');
-  assert.match(html, /2\/4 人/, 'reported seats still render');
+  assert.match(html, /2\/4/, 'reported seats still render');
 
   // Hostile URL falls back to the official web entry — never the loopback link.
   assert.ok(!html.includes('127.0.0.1'), 'loopback URL must not survive');
   assert.match(html, /data-href="https:\/\/weishu\.jiangjiangze\.icu\/\?room=DDDD"/);
+
+  // Every row carries its data source tag（本站房间牌）— the board rows are all `board` here.
+  assert.match(html, /title="房间来源：本站房间牌（玩家上报）">本站</);
 
   assert.match(els.status.textContent, /5 个房间/);
   assert.match(els.visitors.textContent, /大厅访客 7 人/);
 
   // A room without a local token renders no 我的 affordances.
   assert.ok(!html.includes('data-act="destroy"'), 'no destroy button without an owned token');
+});
+
+test('page: 数据来源 — 三社区源聚合、逐行来源标签、页脚标注', async () => {
+  const { list, els, calls } = await runPage(
+    { ok: true, now: NOW, ttlSec: 600, visitors: 2, rooms: [ROOM_OPEN] },
+    { community: { rainya: [COMMUNITY_RAINYA], lunar: [COMMUNITY_LUNAR], rinko: [] } },
+  );
+
+  const html = list.innerHTML;
+  // 社区行进入同一张牌面，并各自带「来源网站」标签（标签正文 = 域名，点开即对应站点）。
+  assert.match(html, /KKKK/);
+  assert.match(html, /LLLL/);
+  assert.match(html, /class="tag tag--src" href="https:\/\/game\.rainya\.me\/"[^>]*title="房间来源：raiya服（game\.rainya\.me）">game\.rainya\.me<\/a>/);
+  assert.match(html, /class="tag tag--src" href="https:\/\/stronghold\.lunar\.ag\/"[^>]*title="房间来源：Lunar（stronghold\.lunar\.ag）">stronghold\.lunar\.ag<\/a>/);
+  // 本站行也标「本站」。
+  assert.match(html, /title="房间来源：本站房间牌（玩家上报）">本站</);
+  // live 行没有时间戳 → 「在线」而不是空的「分钟前」。
+  assert.match(html, /在线/);
+  assert.match(els.status.textContent, /已连接 · 3 个房间/);
+
+  // 四个源都真的请求了：一间房牌 + 三条中转（src 白名单键，绝不带 URL）。
+  const urls = calls.map((c) => c.url);
+  assert.ok(urls.includes('/api/rooms'), 'board polled');
+  for (const src of ['rainya', 'lunar', 'rinko']) {
+    assert.ok(urls.includes('/api/community?src=' + src), 'relay polled: ' + src);
+  }
+});
+
+test('page: 数据来源 — 单源不可达只在来源标注里点名，不挡住别的源', async () => {
+  const { list, els } = await runPage(
+    { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] },
+    {
+      fetch: (url, options) => {
+        if (String(url).includes('src=rainya')) return jsonRes({ ok: false, error: 'UPSTREAM' }, 502);
+        const relay = String(url).match(/src=([a-z]+)$/);
+        if (relay) return jsonRes({ ok: true, src: relay[1], fetchedAt: 0, rooms: [] });
+        return jsonRes({ ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] });
+      },
+    },
+  );
+
+  assert.match(list.innerHTML, /AAAA/, 'board rooms still render when one relay is down');
+  assert.match(els['src-state'].textContent, /raiya服 暂不可达/);
+  assert.equal(els['src-state'].className, 'src-err');
+  assert.match(els.status.textContent, /部分来源不可达 · 1 个房间/);
+});
+
+test('page: 数据来源 — 静态标注写全四个来源（含网站域名）', () => {
+  // 页脚「数据来源」标注：本站房间牌 + 三个社区站，站点写明白域名，链接为 https 常量。
+  assert.match(PAGE_HTML, /数据来源/);
+  assert.match(PAGE_HTML, /本站房间牌（玩家上报）/);
+  assert.match(PAGE_HTML, /raiya服（game\.rainya\.me）/);
+  assert.match(PAGE_HTML, /Lunar（stronghold\.lunar\.ag）/);
+  assert.match(PAGE_HTML, /梨子湖（卫\.rinko\.ai）/);
+  assert.match(PAGE_HTML, /href="https:\/\/xn--rlr\.rinko\.ai\/"/);
+});
+
+test('page: 合并规则 — 同房号不同主机各留一条，同主机同房号本站优先', async () => {
+  const { api } = await runPage({ ok: true, now: NOW, rooms: [] });
+
+  const board = api.shapeRoom({ code: 'kmnp', serverId: 'weishu', serverName: '站长服务', url: 'https://weishu.jiangjiangze.icu/' }, 'board');
+  const dupBoard = api.shapeRoom({ code: 'KMNP', serverId: 'weishu', serverName: '站长服务', url: 'https://weishu.jiangjiangze.icu/other' }, 'board');
+  const otherHost = api.shapeRoom({ code: 'KMNP', serverId: 'lunar', serverName: 'Lunar', url: 'https://stronghold.lunar.ag/', live: true }, 'lunar');
+  const badCode = api.shapeRoom({ code: 'IOIO', serverId: 'x', serverName: 'x' }, 'board');
+  const hostile = api.shapeRoom({ code: 'ZZZZ', serverId: 'x', serverName: 'x', url: 'http://127.0.0.1/x' }, 'board');
+
+  assert.equal(api.shapeRoom(null, 'board'), null);
+  assert.equal(badCode, null, 'I/O are not in the room-code alphabet');
+  assert.equal(hostile.url, '', 'loopback url is dropped by the shared deny table');
+
+  const merged = api.mergeRooms({ board: [board, dupBoard], rainya: [], lunar: [otherHost], rinko: [] });
+  assert.equal(merged.length, 2, 'same host+code dedupes; another host keeps its own row');
+  assert.equal(merged[0].src, 'board', 'board rows lead the merge');
+  assert.equal(merged[0].url, 'https://weishu.jiangjiangze.icu/', 'first board row wins the dedupe');
+  assert.equal(merged[1].src, 'lunar');
+});
+
+test('page: 排序 — 可加入 → 对局中 → 满员；无时间戳的常驻行排在本组末尾', async () => {
+  const { api } = await runPage({ ok: true, now: NOW, rooms: [] });
+  const fresh = api.shapeRoom({ code: 'AAAA', serverId: 's1', serverName: '本站服务', ageSec: 40 }, 'board');
+  const stale = api.shapeRoom({ code: 'BBBB', serverId: 's2', serverName: '本站服务', ageSec: 400 }, 'board');
+  const station = api.shapeRoom({ code: 'CCCC', serverId: 'lunar', serverName: 'Lunar', url: 'https://stronghold.lunar.ag/', live: true }, 'lunar');
+  const playing = api.shapeRoom({ code: 'DDDD', serverId: 's3', serverName: '本站服务', status: 'playing', ageSec: 10 }, 'board');
+  const full = api.shapeRoom({ code: 'EEEE', serverId: 's4', serverName: '本站服务', occupied: 4, capacity: 4, ageSec: 10 }, 'board');
+
+  const sorted = api.sortRooms([full, station, stale, playing, fresh], NOW).map((r) => r.code);
+  assert.deepEqual(sorted, ['AAAA', 'BBBB', 'CCCC', 'DDDD', 'EEEE']);
 });
 
 test('page: empty board and offline state render explicit guidance', async () => {
@@ -161,11 +268,13 @@ test('page: empty board and offline state render explicit guidance', async () =>
 });
 
 test('page: 提交房间面板默认折叠，且新增能力不需要放开 CSP', () => {
-  assert.match(PAGE_HTML, /<section class="submit" id="submit" hidden>/);
+  assert.match(PAGE_HTML, /<section class="lobby-submit" id="submit" hidden>/);
   assert.match(PAGE_HTML, /id="open-submit"/);
-  // The submit/去重 flow is same-origin only: connect-src stays 'self', no new origins.
+  // The page stays same-origin only: connect-src 'self', fonts/images are inline data: URIs.
   assert.match(PAGE_HTML, /connect-src 'self'/);
   assert.ok(!/connect-src[^"]*https:/.test(PAGE_HTML), 'no third-party connect-src');
+  assert.match(PAGE_HTML, /font-src data:/);
+  assert.ok(!/https?:\/\/[^"']*\.woff2/.test(PAGE_HTML), 'fonts are embedded, not linked');
 });
 
 test('page: 房号输入归一 + 提交载荷校验（与服务端同一套规则，先给中文提示）', async () => {
@@ -209,7 +318,7 @@ test('page: 房号输入归一 + 提交载荷校验（与服务端同一套规�
   assert.match(api.errorText(undefined, '', 502), /HTTP 502/);
 });
 
-test('page: 提交房间 → POST /api/rooms + 存 token，刷新后卡片带「我的」/改备注/销毁', async () => {
+test('page: 提交房间 → POST /api/rooms + 存 token，刷新后行上带「我的」/改备注/销毁', async () => {
   const roomsAfter = {
     ok: true, now: NOW, ttlSec: 600, visitors: 1,
     rooms: [{ code: 'ABCD', serverId: 'weishu', serverName: '站长服务', leftSec: 597, url: 'https://weishu.jiangjiangze.icu/' }],
@@ -237,8 +346,8 @@ test('page: 提交房间 → POST /api/rooms + 存 token，刷新后卡片带「
 
   await api.load();
   const html = list.innerHTML;
-  assert.match(html, /class="card mine"/);
-  assert.match(html, /badge mine">我的</);
+  assert.match(html, /class="room is-open is-mine"/);
+  assert.match(html, /badge is-mine">我的</);
   assert.match(html, /data-act="note" data-code="ABCD"/);
   assert.match(html, /data-act="destroy" data-code="ABCD"/);
   assert.match(html, /剩 10 分钟/, 'owned rooms show the remaining TTL, not "x 分钟前"');
