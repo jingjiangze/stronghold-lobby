@@ -46,15 +46,14 @@ test('names: 不误伤（词边界生效）', () => {
 });
 
 test('names: 纯函数 + 无状态（多线程/多 isolate 就绪）', () => {
-  const seq1 = ['fuck', '站长服务', 'аsshole', '小鹿宝', 'f4ck'].map((s) => hasBlockedText(s));
-  const seq2 = ['小鹿宝', 'f4ck', 'fuck', '站长服务', 'аsshole'].map((s) => hasBlockedText(s));
-  assert.deepEqual(seq1.slice().sort(), seq2.slice().sort(), '判定与调用顺序无关');
+  // 逐项断言（而不是比较「排序后的布尔值」—— 那样两个输入互换结果也能骗过测试）
+  const expect = { fuck: true, '站长服务': false, 'аsshole': true, '小鹿宝': false, f4ck: true, '缺两人，速来': false };
+  const inputs = Object.keys(expect);
+  for (const s of inputs) assert.equal(hasBlockedText(s), expect[s], `顺序 A：${s}`);
+  for (const s of inputs.slice().reverse()) assert.equal(hasBlockedText(s), expect[s], `顺序 B：${s}`);
   assert.equal(hasBlockedText('fuck'), true, '重复调用结果一致');
   assert.equal(hasBlockedText('fuck'), true);
-  // 输入不被改动
-  const raw = '  ＦｕＣｋ  ';
-  hasBlockedText(raw);
-  assert.equal(raw, '  ＦｕＣｋ  ');
+  // 变体函数也是纯的（同输入同输出）
   assert.deepEqual(textVariants('f.u.c.k'), textVariants('f.u.c.k'));
   // 词表是冻结数据
   assert.ok(Object.isFrozen(BLOCKED_EN) && Object.isFrozen(BLOCKED_ZH));
