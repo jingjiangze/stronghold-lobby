@@ -292,6 +292,7 @@ export const PAGE_HTML = `<!doctype html>
   .room.is-open .room__code{color:var(--mint-400)}
   .room.is-live .room__code{color:var(--amber)}
   .room.is-full .room__code{color:var(--text-lo)}
+  .room.is-closed .room__code{color:var(--text-lo)}
   .room__name{
     flex:0 1 auto; min-width:0; font-size:.17rem; font-weight:700; letter-spacing:.04em; color:var(--text-hi);
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -311,6 +312,7 @@ export const PAGE_HTML = `<!doctype html>
   }
   .badge.is-open{color:var(--mint-400); border-color:var(--mint-a35); background:var(--mint-a10)}
   .badge.is-live{color:var(--amber); border-color:rgba(246,163,41,.4); background:rgba(246,163,41,.08)}
+  .badge.is-closed{color:var(--text-lo); border-color:var(--line-2); background:transparent}
   .badge.is-mine{color:var(--gold-2); border-color:var(--gold-a20); background:rgba(255,198,0,.06)}
   .room__note{
     font-size:.13rem; line-height:1.55; color:var(--text-md); border-left:.02rem solid var(--line-2);
@@ -763,9 +765,10 @@ export const PAGE_HTML = `<!doctype html>
     return Math.floor(sec / 86400) + ' 天前';
   }
 
-  // 可加入 = 未对局且未满员；对局中 = 观战；满员 = 置灰（仍展示，便于换房时心里有数）。
+  // 可加入 = 未对局且未满员；对局中 = 观战；已关闭 = 公告/下架行（置灰不可点，仍置顶展示）。
   function stateOf(r) {
     if (r.inMatch === true || String(r.status) === 'playing') return 'live';
+    if (String(r.status) === 'closed') return 'closed';
     var occ = Number(r.occupied) || 0, cap = Number(r.capacity) || 0;
     if (cap > 0 && occ >= cap) return 'full';
     return 'open';
@@ -785,7 +788,8 @@ export const PAGE_HTML = `<!doctype html>
   }
 
   function sortRooms(rooms, now) {
-    function rank(r) { var s = stateOf(r); return s === 'open' ? 0 : s === 'live' ? 1 : 2; }
+    // closed 与 open 同组：公告/下架行通常是最新的，只有同组才会保持置顶（组内仍最新在前）。
+    function rank(r) { var s = stateOf(r); return s === 'open' || s === 'closed' ? 0 : s === 'live' ? 1 : 2; }
     return rooms.slice(0).sort(function (a, b) {
       var ra = rank(a), rb = rank(b);
       if (ra !== rb) return ra - rb;                                         // 可加入 → 可观战 → 满员
@@ -1193,7 +1197,7 @@ export const PAGE_HTML = `<!doctype html>
       : (probeText
         ? '<span class="room__seats room__seats--server" title="该服务器自报的聚合数字，不是本房间的人数"><span class="num">' + esc(probeText) + '</span><span class="micro">服务器级</span></span>'
         : '');
-    var badgeText = st === 'open' ? '开放' : st === 'live' ? '对局中' : '满员';
+    var badgeText = st === 'open' ? '开放' : st === 'closed' ? '已关闭' : st === 'live' ? '对局中' : '满员';
     var badges = '<span class="room__badges">'
       + (mineEntry ? '<span class="badge is-mine">我的</span>' : '')
       + '<span class="badge is-' + st + '">' + badgeText + '</span></span>';
@@ -1201,7 +1205,9 @@ export const PAGE_HTML = `<!doctype html>
       ? '<button class="btn btn--primary btn--sm" data-href="' + esc(targetFor(r, false)) + '"><span class="btn__label">加入</span></button>'
       : st === 'live'
         ? '<button class="btn btn--amber btn--sm" data-href="' + esc(targetFor(r, true)) + '"><span class="btn__label">观战</span></button>'
-        : '<button class="btn btn--sm" disabled><span class="btn__label">满员</span></button>';
+        : st === 'closed'
+          ? '<button class="btn btn--sm" disabled><span class="btn__label">已关闭</span></button>'
+          : '<button class="btn btn--sm" disabled><span class="btn__label">满员</span></button>';
     // 我的房间：剩余时间代替「X 分钟前」，并在行内给出改备注 / 销毁（与面板同一套动作）。
     var left = Number(r.leftSec);
     var ageLabel = mineEntry

@@ -621,3 +621,16 @@ test('probe (C)：按 origin 缓存 60s —— 两次刷新只探一次', async 
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(probes.length, 1, '60s 窗口内同一 origin 只探一次');
 });
+
+test('page: a closed room shows 已关闭 with a disabled action and keeps the top group', async () => {
+  const CLOSED = {
+    code: 'NEWS', serverId: 'notice', serverName: '公告', note: '主仓库 0.2.0 已发布',
+    status: 'closed', ageSec: 0, leftSec: 600,
+  };
+  const { list } = await runPage({ ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [CLOSED, ROOM_OPEN] });
+  const html = list.innerHTML;
+  assert.match(html, /class="badge is-closed">已关闭</, 'closed badge');
+  assert.match(html, /<button class="btn btn--sm" disabled><span class="btn__label">已关闭<\/span><\/button>/, 'disabled action');
+  assert.ok(!/data-href="[^"]*room=NEWS/.test(html), 'a closed row is never a join target');
+  assert.ok(html.indexOf('NEWS') < html.indexOf('AAAA'), 'closed rows share the top group (newest first)');
+});
