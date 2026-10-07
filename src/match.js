@@ -37,6 +37,8 @@ export const MATCH_TTL_MS = 180_000;
 export const ROOM_TTL_MS = 600_000;
 /** Hard cap on simultaneously waiting entries (protects the DO from abuse). */
 export const MAX_QUEUE = 60;
+/** v7：一次匹配解散（房主没建房）后，客人最多被放回队列几次 —— 防「房主反复不建房」的活锁。 */
+export const MAX_REQUEUES = 3;
 /** Accepted POST/DELETE operations per IP per window (status GETs are never rate-limited). */
 export const IP_OPS_MAX = 30;
 export const IP_OPS_WINDOW_MS = 60_000;
@@ -96,8 +98,17 @@ function isQueueEntry(v) {
     && typeof v.id === 'string' && v.id
     && typeof v.token === 'string' && v.token
     && DIFFS.includes(v.difficulty)
-    && typeof v.joinedAt === 'number' && Number.isFinite(v.joinedAt),
+    && typeof v.joinedAt === 'number' && Number.isFinite(v.joinedAt)
+    && (v.expiresAt === undefined || (typeof v.expiresAt === 'number' && Number.isFinite(v.expiresAt)))
+    && (v.requeues === undefined || (Number.isInteger(v.requeues) && v.requeues >= 0)),
   );
+}
+
+/** 队列条目的过期时刻（v7）：进队与「被放回队列」都会重算；joinedAt 只用于排序与「已等多久」。 */
+function queueDeadline(entry) {
+  return typeof entry.expiresAt === 'number' && Number.isFinite(entry.expiresAt)
+    ? entry.expiresAt
+    : entry.joinedAt + QUEUE_TTL_MS;
 }
 
 function isMatchEntry(v) {
@@ -112,7 +123,7 @@ function isMatchEntry(v) {
 }
 
 /** Public view of a waiting entry (token never leaks). */
-function publicQueue(entry, t, waiting) {
+function publicQueue(entry, t, waiting, oldestJoinedAt) {
   return {
     ok: true,
     state: 'waiting',
@@ -121,6 +132,9 @@ function publicQueue(entry, t, waiting) {
     waiting: typeof waiting === 'number' ? waiting : undefined,
     need: GROUP_SIZE,
     queuedSec: Math.max(0, Math.floor((t - entry.joinedAt) / 1000)),
+    // v7 可观测性：本难度队列里最久的等待（秒）—— 饿死一眼可见；requeued = 被放回队列的次数
+    oldestWaitSec: Number.isFinite(oldestJoinedAt) ? Math.max(0, Math.floor((t - oldestJoinedAt) / 1000)) : undefined,
+    requeued: Number.isInteger(entry.requeues) && entry.requeues > 0 ? entry.requeues : undefined,
   };
 }
 
@@ -183,19 +197,44 @@ export function createMatch({ state, now, random } = {}) {
     const queue = [];
     const matches = [];
     const dead = [];
+    /** v7：解散后要放回队列的客人（等 dead 清理完再写，避免自己删自己）。 */
+    const requeues = [];
     for (const pair of pairs) {
       if (!pair) continue;
       const key = pair[0];
       const value = pair[1];
       if (typeof key !== 'string') continue;
       if (key.startsWith(Q)) {
-        if (!isQueueEntry(value) || t - value.joinedAt >= QUEUE_TTL_MS) dead.push(key);
+        if (!isQueueEntry(value) || t >= queueDeadline(value)) dead.push(key);
         else queue.push(value);
       } else if (key.startsWith(M)) {
         if (!isMatchEntry(value) || value.expiresAt <= t) {
           dead.push(key);
           if (isMatchEntry(value)) {
             for (const m of value.members) dead.push(I + m.id);
+            // v7 公平性：**房主没建房的解散 → 客人按原位次放回队列**（joinedAt / id / token 全保留，
+            // 只把 TTL 重算 + 记一次 requeues）——已到的人不该为房主没兑现而重新排队。
+            // 房主自己出局（他没兑现）。已经有房的记录只是过了加入窗口，不做任何重排。
+            if (!value.room) {
+              for (const m of value.members) {
+                if (m.id === value.hostId) continue;
+                if ((m.requeues || 0) >= MAX_REQUEUES) continue;
+                requeues.push({
+                  key: Q + m.id,
+                  entry: {
+                    id: m.id,
+                    token: m.token,
+                    difficulty: value.difficulty,
+                    venue: m.venue,
+                    app: m.app || '',
+                    ip: m.ip,
+                    joinedAt: m.joinedAt,
+                    expiresAt: t + QUEUE_TTL_MS,
+                    requeues: (m.requeues || 0) + 1,
+                  },
+                });
+              }
+            }
           }
         } else {
           matches.push(value);
@@ -211,6 +250,12 @@ export function createMatch({ state, now, random } = {}) {
       }
     }
     for (const key of dead) await state.delete(key);
+    // v7：把解散的客人放回队列（容量上限内；满了就只能让他们走正常重排）
+    for (const item of requeues) {
+      if (queue.length + 1 > MAX_QUEUE) break;
+      await state.put(item.key, item.entry);
+      queue.push(item.entry);
+    }
     // an index pointing at a swept match is dead too
     const liveIds = new Set(matches.map((m) => m.id));
     for (const pair of pairs) {
@@ -269,6 +314,7 @@ export function createMatch({ state, now, random } = {}) {
       app,
       ip,
       joinedAt: t,
+      expiresAt: t + QUEUE_TTL_MS, // v7：TTL 与排序分开（放回队列只重算 TTL，不动位次）
     };
     await state.put(Q + entry.id, entry);
 
@@ -284,7 +330,8 @@ export function createMatch({ state, now, random } = {}) {
         id: makeHex(random, ID_BYTES),
         difficulty,
         hostId: host.id,
-        members: members.map((m) => ({ id: m.id, token: m.token, venue: m.venue, app: m.app, joinedAt: m.joinedAt })),
+        // v7：requeues 要跟着条目一起进 match —— 否则解散放回时计数永远从 0 起算，上限形同虚设
+        members: members.map((m) => ({ id: m.id, token: m.token, venue: m.venue, app: m.app, ip: m.ip, joinedAt: m.joinedAt, requeues: m.requeues })),
         room: null,
         createdAt: t,
         expiresAt: t + MATCH_TTL_MS,
@@ -318,11 +365,15 @@ export function createMatch({ state, now, random } = {}) {
       const listed = await state.list();
       const pairs = listed instanceof Map ? listed.entries() : (listed || []);
       let waiting = 0;
+      let oldest = Infinity;
       for (const pair of pairs) {
         if (pair && typeof pair[0] === 'string' && pair[0].startsWith(Q)
-          && isQueueEntry(pair[1]) && pair[1].difficulty === queued.difficulty) waiting++;
+          && isQueueEntry(pair[1]) && pair[1].difficulty === queued.difficulty) {
+          waiting++;
+          if (pair[1].joinedAt < oldest) oldest = pair[1].joinedAt;
+        }
       }
-      return publicQueue(queued, t, waiting);
+      return publicQueue(queued, t, waiting, oldest);
     }
 
     const matchId = await state.get(I + id);
