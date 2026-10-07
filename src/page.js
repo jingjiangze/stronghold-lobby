@@ -343,6 +343,12 @@ export const PAGE_HTML = `<!doctype html>
   .lobby-state{border:1px dashed var(--line-2); padding:.32rem .18rem; text-align:center;
     color:var(--text-lo); font-size:.15rem; line-height:1.7}
   .lobby-state b{display:block; color:var(--text-hi); margin-bottom:.06rem; font-size:.17rem; letter-spacing:.04em}
+  .lobby-notice{display:flex; gap:.1rem; align-items:flex-start; margin:0 0 .14rem;
+    padding:.14rem .16rem; border:1px solid rgba(232,195,126,.45); border-left-width:3px;
+    border-radius:6px; background:rgba(232,195,126,.07); color:var(--text-hi);
+    font-size:.14rem; line-height:1.7}
+  .lobby-notice b{flex:0 0 auto; color:#e8c37e; letter-spacing:.04em}
+  .lobby-notice span{color:var(--text-lo)}
   .spin{
     display:inline-block; width:.2rem; height:.2rem; margin-right:.08rem; vertical-align:-.03rem;
     border:2px solid var(--mint-500);
@@ -726,6 +732,9 @@ export const PAGE_HTML = `<!doctype html>
       live: raw.live === true,                    // 实时大厅源：没有 TTL/时间戳
       ageSec: Number.isFinite(age) && age >= 0 ? age : -1,
       leftSec: Number.isFinite(left) && left >= 0 ? left : -1,
+      // 房间牌注入的置顶公告行：pinned 标记 + 完整文案（横幅用），其余字段照常投影。
+      pinned: raw.pinned === true,
+      notice: typeof raw.notice === 'string' ? raw.notice.slice(0, 200) : '',
     };
   }
 
@@ -1176,6 +1185,13 @@ export const PAGE_HTML = `<!doctype html>
     }
   }
 
+  /** 置顶公告横幅：房间牌注入的 pinned 行（不可加入，只作公告）。 */
+  function noticeBanner(r) {
+    var text = String(r.notice || r.note || '');
+    var title = String(r.serverName || r.server || '官方公告');
+    return '<div class="lobby-notice" role="status"><b>⚠ ' + esc(title) + '</b><span>' + esc(text) + '</span></div>';
+  }
+
   function card(r, now, mine) {
     var st = stateOf(r);
     var mineEntry = mine[r.code] || null;
@@ -1305,10 +1321,14 @@ export const PAGE_HTML = `<!doctype html>
 
   function render() {
     var now = Date.now();
-    var rooms = sortRooms(mergeRooms({
+    var allRows = sortRooms(mergeRooms({
       board: sources.board.list, rainya: sources.rainya.list,
       lunar: sources.lunar.list, rinko: sources.rinko.list,
     }), now);
+    // 置顶公告（房间牌注入的 pinned 行）：渲染成横幅，不进房间网格、不计入房间数。
+    var notices = allRows.filter(function (r) { return r && r.pinned === true; });
+    var rooms = allRows.filter(function (r) { return !(r && r.pinned === true); });
+    var banner = notices.map(noticeBanner).join('');
     probeKick(rooms); // C：行上缺房间级数字时，顺路读一眼那个服的 /healthz（公开只读聚合数字）
     var mine = liveMine();
     last = rooms;
@@ -1332,13 +1352,13 @@ export const PAGE_HTML = `<!doctype html>
     if (serversEl) serversEl.innerHTML = known.map(function (s) { return '<option value="' + esc(s.name) + '"></option>'; }).join('');
 
     if (!rooms.length) {
-      list.innerHTML = failed.length === SOURCE_ORDER.length
+      list.innerHTML = banner + (failed.length === SOURCE_ORDER.length
         ? '<div class="lobby-state"><b>暂时连不上大厅服务</b>房间牌与社区源都不可达，将在 20 秒后自动重试。</div>'
         : '<div class="lobby-state"><b>现在没有公开的房间</b>刚开好一局？点上方「＋ 提交房间」把房号发布到大厅；'
-          + '或去下载客户端自己开服。<br /><br /><a href="https://dl.jiangjiangze.icu" target="_blank" rel="noopener noreferrer">前往下载页 →</a></div>';
+          + '或去下载客户端自己开服。<br /><br /><a href="https://dl.jiangjiangze.icu" target="_blank" rel="noopener noreferrer">前往下载页 →</a></div>');
       return;
     }
-    list.innerHTML = rooms.map(function (r) { return card(r, now, mine); }).join('')
+    list.innerHTML = banner + rooms.map(function (r) { return card(r, now, mine); }).join('')
       + (actText ? '<p class="lobby-hint">' + esc(actText) + '</p>' : '');
     Array.prototype.forEach.call(list.querySelectorAll('.btn[data-href]'), function (b) {
       b.addEventListener('click', function () { window.open(b.getAttribute('data-href'), '_blank', 'noopener'); });

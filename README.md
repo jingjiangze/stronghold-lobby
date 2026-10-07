@@ -60,6 +60,14 @@ tools/apk/lobby-worker/
 | OPTIONS | `*` | — | `204` | CORS 预检 |
 | GET | `/api/health` | — | `200 {ok:true, now}` | 无状态上线自检 |
 
+## 置顶公告（`GET /api/rooms` 注入的 pinned 行）
+
+`GET /api/rooms` 会**在最前面注入一条 room 形状的公告行**（`code: NEWS`、`serverId: sp-notice`、`status: closed`、`pinned: true`、`notice: <完整文案>`），其余路由不受影响（写入响应里没有它）。
+
+- **为什么要做成「行」**：APK 的大厅面板只渲染房间行（房号 + 难度 + 备注 + 状态），没有通用消息位 —— 公告只能以房间的形状搭车。`status: closed` 让面板把它渲染成**禁用按钮 + 「已关闭」**（`roomJoinable()` 直接为假），所以它永远不会被点进一个不存在的房间；面板行里的可见文字用 `difficultyName`（≤16 字）与 `note`（≈14 字）两个槽位。
+- **网页**（`GET /`）：`pinned` 行**不进房间网格**，而是渲染成顶部横幅（`notice` 全文，`role="status"`），也不计入「N 个房间」。
+- **改文案 / 关掉**：`wrangler.toml` 的 `[vars] NOTICE_TEXT`（默认即当前公告）→ `npx wrangler deploy`；设为 `""` 即完全关闭。代码里只保留行形状（`src/index.js` 的 `noticeRow()`），文案不写死在代码里。
+
 ## 前台网页（`GET /`）
 
 `https://sp-lobby.jiangjiangze.icu/` 直接打开的公开页面（`src/page.js`：单文件 HTML/CSS/JS、零外链、自带 CSP）：**最新的可加入房间排在最前，点一下就进场**；自己开了房也能在页面上直接**提交房间**。

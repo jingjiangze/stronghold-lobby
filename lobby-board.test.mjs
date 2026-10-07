@@ -750,8 +750,8 @@ test('adapter: POST/GET/DELETE round-trip through the Durable Object + status ma
   const listed = await callWorker(env, '/api/rooms');
   assert.equal(listed.status, 200);
   assert.equal(listed.body.ttlSec, 600);
-  assert.equal(listed.body.rooms.length, 1);
-  assert.equal(listed.body.rooms[0].server, 'raiya服');
+  assert.equal(listed.body.rooms.filter((r) => r.code !== 'NEWS').length, 1, 'the notice row is not a room');
+  assert.equal(listed.body.rooms.find((r) => r.code === 'WXYZ').server, 'raiya服');
 
   const badToken = await callWorker(env, '/api/rooms?code=WXYZ&serverId=s1', { method: 'DELETE', token: 'bad' });
   assert.equal(badToken.status, 403);
@@ -808,7 +808,7 @@ test('adapter: PATCH /api/rooms edits via X-Token; difficulty rides POST/GET; PU
   assert.equal(created.body.added.difficulty, 'HARD', 'difficulty passes through the adapter');
 
   const listed0 = await callWorker(env, '/api/rooms');
-  assert.equal(listed0.body.rooms[0].difficulty, 'HARD');
+  assert.equal(listed0.body.rooms.find((r) => r.code === 'MNPQ').difficulty, 'HARD');
 
   const edited = await callWorker(env, '/api/rooms', {
     method: 'PATCH',
@@ -819,8 +819,9 @@ test('adapter: PATCH /api/rooms edits via X-Token; difficulty rides POST/GET; PU
   assert.deepEqual(edited.body, { ok: true, updated: { code: 'MNPQ', serverId: 's1', note: 'second' } });
 
   const listed = await callWorker(env, '/api/rooms');
-  assert.equal(listed.body.rooms[0].note, 'second');
-  assert.equal(listed.body.rooms[0].difficulty, 'HARD', 'PATCH leaves difficulty alone');
+  const patched = listed.body.rooms.find((r) => r.code === 'MNPQ');
+  assert.equal(patched.note, 'second');
+  assert.equal(patched.difficulty, 'HARD', 'PATCH leaves difficulty alone');
 
   const wrong = await callWorker(env, '/api/rooms', {
     method: 'PATCH',
@@ -969,4 +970,28 @@ test('visitors: the board payload shape stays additive for old clients', async (
   assert.ok(Number.isInteger(out.visitors), 'visitors is an integer (0 when nobody polled)');
   assert.equal(out.ttlSec, 600);
   assert.ok(Array.isArray(out.rooms));
+});
+
+test('adapter: GET /api/rooms prepends the pinned notice row; writes carry none', async () => {
+  const { env } = fakeEnv();
+  const listed = await callWorker(env, '/api/rooms');
+  assert.equal(listed.status, 200);
+  const first = listed.body.rooms[0];
+  assert.equal(first.code, 'NEWS', 'the notice leads the list');
+  assert.equal(first.pinned, true);
+  assert.equal(first.status, 'closed', 'non-joinable by construction');
+  assert.equal(typeof first.notice, 'string');
+  assert.ok(first.notice.length > 10, 'carries the full text for the web banner');
+  assert.equal(listed.body.rooms.filter((r) => r.code === 'NEWS').length, 1, 'exactly one notice');
+
+  const created = await callWorker(env, '/api/rooms', {
+    method: 'POST', ip: '203.0.113.77', body: { code: 'ABCD', serverId: 's1', serverName: 'x' },
+  });
+  assert.equal(created.status, 201);
+  assert.ok(!('rooms' in created.body), 'write responses never carry the notice');
+
+  const off = fakeEnv();
+  off.env.NOTICE_TEXT = '';
+  const bare = await callWorker(off.env, '/api/rooms');
+  assert.equal(bare.body.rooms.filter((r) => r.code === 'NEWS').length, 0, 'NOTICE_TEXT="" switches it off');
 });
