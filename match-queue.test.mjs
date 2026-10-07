@@ -6,7 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMatch, DIFFS, GROUP_SIZE, MAX_QUEUE, IP_OPS_MAX, QUEUE_TTL_MS, MATCH_TTL_MS, ROOM_TTL_MS }
+import { createMatch, DIFFS, GROUP_SIZE, MAX_QUEUE, MAX_REQUEUES, IP_OPS_MAX, QUEUE_TTL_MS, MATCH_TTL_MS, ROOM_TTL_MS }
   from './src/match.js';
 
 function memState() {
@@ -173,9 +173,11 @@ test('ttl: waiting entries expire after QUEUE_TTL_MS; room-less matches dissolve
   const last = await join(core, 'NORMAL', 'local', '', '10.0.0.5');
   assert.equal(last.state, 'matched');
   clock.t += MATCH_TTL_MS + 1;
+  // v7：b 是这局的房主（最老的 local 席位）—— 他没建房 → 自己出局；三个客人被放回队列。
   assert.equal((await core.status({ id: b.id, token: b.token })).state, 'expired');
   const swept = await core.sweep();
-  assert.equal(swept.pending, false, 'nothing lingers after the sweep');
+  assert.equal(swept.pending, true, 'the three guests are back in the queue (v7 fairness)');
+  assert.equal(swept.queue.length, 3, 'exactly the non-host members were re-queued');
 
   // a posted room stretches the record's life to ROOM_TTL_MS
   const h1 = await join(core, 'ABYSS', 'local', '', '10.0.0.6'); // oldest → host
@@ -188,6 +190,74 @@ test('ttl: waiting entries expire after QUEUE_TTL_MS; room-less matches dissolve
     'with a room the record survives past MATCH_TTL_MS');
   clock.t += ROOM_TTL_MS;
   assert.equal((await core.status({ id: h1.id, token: h1.token })).state, 'expired');
+});
+
+test('v7 fairness: a room-less dissolve re-queues the guests in place and drops the host', async () => {
+  const { core, clock } = makeHarness();
+  const g1 = await join(core, 'HARD', 'local', '', '10.1.0.1');
+  const g2 = await join(core, 'HARD', 'local', '', '10.1.0.2');
+  const g3 = await join(core, 'HARD', 'local', '', '10.1.0.3');
+  clock.t += 40_000;                       // 三位客人已经等了 40 秒
+  const host = await join(core, 'HARD', 'public', 'stronghold', '10.1.0.9'); // 公开服 → 房主
+  assert.equal(host.state, 'matched');
+  assert.equal(host.role, 'host');
+
+  clock.t += MATCH_TTL_MS + 1;             // 房主没建房，匹配解散
+  const after = await core.status({ id: g1.id, token: g1.token });
+  assert.equal(after.state, 'waiting', 'a guest is back in the queue, not expired');
+  assert.equal(after.queuedSec, 40 + Math.floor((MATCH_TTL_MS + 1) / 1000),
+    'their wait keeps counting from the original joinedAt (no reset)');
+  assert.equal(after.requeued, 1, 'the re-queue is observable');
+  assert.equal((await core.status({ id: host.id, token: host.token })).state, 'expired',
+    'the host who never opened the room is out');
+
+  // 原位次：新来的人与这三位组成下一局（老 joinedAt 让他们仍是队首）
+  const next = await join(core, 'HARD', 'public', 'stronghold', '10.1.0.8');
+  assert.equal(next.state, 'matched');
+  assert.equal(next.role, 'host');
+  const memberIds = (await core.status({ id: next.id, token: next.token })).members.map((m) => m.id).sort();
+  assert.deepEqual(memberIds, [g1.id, g2.id, g3.id, next.id].sort(), 'the three re-queued guests are in the next match');
+});
+
+test('v7 fairness: the re-queue refreshes the TTL but never the position, and it is capped', async () => {
+  const { core, clock } = makeHarness();
+  const g1 = await join(core, 'ABYSS', 'local', '', '10.2.0.1');
+  const g2 = await join(core, 'ABYSS', 'local', '', '10.2.0.2');
+  const g3 = await join(core, 'ABYSS', 'local', '', '10.2.0.3');
+
+  // 反复「凑齐 → 房主不建房 → 解散」，客人的 joinedAt 不动、TTL 每次重算
+  for (let round = 1; round <= MAX_REQUEUES; round++) {
+    const host = await join(core, 'ABYSS', 'public', 'stronghold', `10.2.9.${round}`);
+    assert.equal(host.state, 'matched', `round ${round}: grouped`);
+    clock.t += MATCH_TTL_MS + 1;
+    const st = await core.status({ id: g1.id, token: g1.token });
+    assert.equal(st.state, 'waiting', `round ${round}: still queued`);
+    assert.equal(st.requeued, round);
+  }
+
+  // 超过上限：不再放回，客人拿到 expired（不再无限循环）
+  const lastHost = await join(core, 'ABYSS', 'public', 'stronghold', '10.2.9.99');
+  assert.equal(lastHost.state, 'matched');
+  clock.t += MATCH_TTL_MS + 1;
+  assert.equal((await core.status({ id: g1.id, token: g1.token })).state, 'expired',
+    `after ${MAX_REQUEUES} re-queues the guest is released`);
+});
+
+test('v7 observability: a waiting status reports the queue depth and the oldest wait', async () => {
+  const { core, clock } = makeHarness();
+  const first = await join(core, 'NORMAL', 'local', '', '10.3.0.1');
+  clock.t += 30_000;
+  const second = await join(core, 'NORMAL', 'local', '', '10.3.0.2');
+
+  const a = await core.status({ id: first.id, token: first.token });
+  assert.equal(a.state, 'waiting');
+  assert.equal(a.waiting, 2, 'both same-difficulty waiters are counted');
+  assert.equal(a.oldestWaitSec, 30, 'the oldest wait is visible (starvation is observable)');
+  assert.equal(a.requeued, undefined, 'no re-queue yet');
+
+  const b = await core.status({ id: second.id, token: second.token });
+  assert.equal(b.oldestWaitSec, 30, 'both see the same oldest wait');
+  assert.equal(b.queuedSec, 0, 'each entry keeps its own wait');
 });
 
 test('limits: per-IP op rate limit and the queue cap', async () => {
