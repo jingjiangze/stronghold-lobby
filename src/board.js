@@ -1,4 +1,5 @@
 // src/board.js — sp-lobby-board PURE CORE: the online-lobby room board ("房间牌").
+import { hasBlockedText } from './names.js';
 //
 // ZERO EGRESS: this file never calls fetch / XMLHttpRequest / WebSocket and never dials or probes a
 // submitted URL — url validation below is SYNTAX-ONLY (WHATWG URL parsing + the deny table copied
@@ -7,6 +8,7 @@
 // in-memory adapter while src/index.js runs the exact same code on a Durable Object.
 //
 // CONTRACT (rainya-compatible, additive fields only):
+//   v7.1: serverName/serverId/note 入库前过审核（src/names.js + src/names-words.js），命中 → BLOCKED_TEXT(400)。
 //   list(now?, {visitorKey?, ip?}) -> { ok:true, now, ttlSec:600, visitors, rooms:[ { code, serverId,
 //                serverName, note, ageSec, leftSec, url?, server, difficulty?, mode?, status?,
 //                occupied?, capacity? } ] }   (v5.2: visitors = 120s 窗口内去重的大厅访客数；
@@ -563,6 +565,12 @@ export function createBoard({ state, now, random } = {}) {
     }
 
     const note = sanitizeNote(raw.note);
+    // v7.1 审核：房间牌的公开文本（服务器名 / 服务器 id / 备注）会原样出现在公开大厅页上，
+    // 入库前过一道词表闸（策略 src/names.js，词表 src/names-words.js）。命中就整条拒绝 ——
+    // 不做「静默清洗」（那样房主会以为自己写的内容发布了）。
+    if (hasBlockedText(serverName) || hasBlockedText(serverId) || hasBlockedText(note)) {
+      return fail('BLOCKED_TEXT', 'serverName/serverId/note contains blocked words');
+    }
     // 可选难度：白名单外一律静默忽略（向后兼容旧客户端），绝不影响可见性/限流/防抖
     const difficulty = normalizeDifficulty(raw.difficulty);
     const ip = normalizeIp(raw.ip);
@@ -662,6 +670,8 @@ export function createBoard({ state, now, random } = {}) {
     // v5.2 追加直播字段：只覆盖「本次带上」的那些，不刷新 TTL，也不动 createdAt/url/token/ip/difficulty。
     const hasNote = Object.prototype.hasOwnProperty.call(raw, 'note');
     const note = hasNote ? sanitizeNote(raw.note) : stored.note;
+    // v7.1：改备注走同一道审核（与 add 同一份策略/词表）
+    if (hasNote && hasBlockedText(note)) return fail('BLOCKED_TEXT', 'note contains blocked words');
     const live = sanitizeLiveFields(raw);
     await state.put(roomKey(code), { ...stored, note, ...live });
     return { ok: true, updated: { code, serverId: stored.serverId, note, ...live } };
