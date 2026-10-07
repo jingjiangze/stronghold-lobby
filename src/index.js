@@ -9,7 +9,6 @@
 //   OPTIONS *              CORS preflight (204)
 //   GET  /                 the public lobby page (src/page.js) — live room board, join/spectate
 //   GET  /api/rooms        rainya-shaped board: { ok, now, ttlSec:600, rooms:[...] }
-//                          (GET also prepends the pinned NOTICE row — see noticeRow())
 //   POST /api/rooms        JSON { code, serverId, serverName, note?, url?, difficulty? } -> 201 { ok, added, token }
 //   PATCH /api/rooms       JSON { code, serverId, note }  header X-Token      -> 200 { ok, updated }
 //                          (only the note changes; createdAt/TTL/url are NOT refreshed)
@@ -213,53 +212,6 @@ const CORS_HEADERS = {
   'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
   'access-control-allow-headers': 'Content-Type,X-Token,X-Device',
 };
-
-/**
- * Pinned lobby notice — ONE synthetic row prepended to every GET /api/rooms.
- *
- * Why a row and not a `notice` field: the APK's lobby panel renders board rows (code + difficulty
- * + note + state) and has no generic message surface, so a notice has to travel room-shaped. The
- * `status: 'closed'` makes it non-joinable, so the panel shows a disabled button and our page
- * renders it as an inert banner instead of a card.
- *
- * The text lives in env (wrangler [vars] NOTICE_TEXT): edit it there and redeploy to change the
- * wording, or set it to "" to switch the notice off — no code change either way.
- */
-const NOTICE_CODE = 'NEWS';
-const NOTICE_DEFAULT_TEXT = '官方 0.2.0 已发布：本 App 仍是 0.1.4 内容，适配完成前不建议使用，请等适配版。';
-
-/** @returns {object|null} the notice row, or null when the notice is switched off. */
-function noticeRow(env) {
-  const text = String((env && env.NOTICE_TEXT) ?? NOTICE_DEFAULT_TEXT).trim();
-  if (!text) return null;
-  return {
-    code: NOTICE_CODE,
-    server: '官方公告',
-    serverId: 'sp-notice',
-    serverName: '官方公告',
-    note: '官方已发 0.2.0',        // the panel's note cell is ~14 chars wide
-    difficultyName: '⚠0.2.0适配中', // its own 16-char span in the panel row
-    status: 'closed',              // never joinable — the panel disables the action
-    ageSec: 0,
-    leftSec: TTL_SEC,
-    pinned: true,
-    notice: text,                  // full text: our web page renders it as a banner
-  };
-}
-
-/** Prepend the notice to a board GET response, preserving status and headers. */
-async function withNotice(response, env) {
-  const row = noticeRow(env);
-  if (!row || response.status !== 200) return response;
-  const text = await response.text();
-  let body;
-  try { body = JSON.parse(text); } catch { return new Response(text, { status: response.status, headers: response.headers }); }
-  if (body && Array.isArray(body.rooms)) {
-    body.rooms = [row, ...body.rooms.filter((r) => !(r && r.code === NOTICE_CODE))];
-    return new Response(JSON.stringify(body), { status: response.status, headers: response.headers });
-  }
-  return new Response(text, { status: response.status, headers: response.headers });
-}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -531,9 +483,7 @@ export default {
       }
       const stub = env.BOARD.get(env.BOARD.idFromName(BOARD_OBJECT_NAME));
       const internal = new Request(`https://board.internal${url.pathname}${url.search}`, { method, headers, body });
-      const forwarded = await stub.fetch(internal);
-      // GET carries the pinned notice (a room-shaped row the APK panel can render); writes do not.
-      return withCors(method === 'GET' ? await withNotice(forwarded, env) : forwarded);
+      return withCors(await stub.fetch(internal));
     } catch (error) {
       return withCors(json({ ok: false, error: 'INTERNAL', message: String((error && error.message) || error) }, 500));
     }

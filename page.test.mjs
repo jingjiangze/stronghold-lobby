@@ -621,18 +621,3 @@ test('probe (C)：按 origin 缓存 60s —— 两次刷新只探一次', async 
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(probes.length, 1, '60s 窗口内同一 origin 只探一次');
 });
-
-test('page: a pinned board row renders as a notice banner, never as a room card', async () => {
-  const NOTICE = {
-    code: 'NEWS', serverId: 'sp-notice', serverName: '官方公告', note: '官方已发 0.2.0',
-    difficultyName: '⚠0.2.0适配中', status: 'closed', ageSec: 0, leftSec: 600, pinned: true,
-    notice: '官方 0.2.0 已发布：本 App 仍是 0.1.4 内容，适配完成前不建议使用，请等适配版。',
-  };
-  const { list, els } = await runPage({ ok: true, now: NOW, ttlSec: 600, visitors: 3, rooms: [NOTICE, ROOM_OPEN] });
-  const html = list.innerHTML;
-  assert.match(html, /class="lobby-notice"/, 'the pinned row becomes a banner');
-  assert.match(html, /官方 0\.2\.0 已发布：本 App 仍是 0\.1\.4 内容/);
-  assert.ok(!/data-href="[^"]*room=NEWS/.test(html), 'a notice is never a join target');
-  assert.match(html, /room=AAAA/, 'real rooms still render');
-  assert.match(els.status.textContent, /1 个房间/, 'the notice does not count as a room');
-});

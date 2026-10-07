@@ -20,11 +20,6 @@ workers_dev = true
 [cache]
 enabled = true
 
-# 置顶公告（GET /api/rooms 会注入一条 room 形状的 pinned 行；APK 大厅面板与网页都渲染它）。
-# 改文案：改这里的 NOTICE_TEXT 再 `npx wrangler deploy`；关掉公告：NOTICE_TEXT = ""（无需改代码）。
-[vars]
-NOTICE_TEXT = "官方 0.2.0 已发布：本 App 仍是 0.1.4 内容，适配完成前不建议使用，请等适配版。"
-
 [durable_objects]
 bindings = [
   { name = "BOARD", class_name = "Board" },
