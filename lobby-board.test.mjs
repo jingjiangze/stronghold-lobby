@@ -871,6 +871,33 @@ test('zero egress: no fetch happened across the whole suite', () => {
 
 // ---- v5.2：大厅访客（搭车计数）与房主直播字段 ------------------------------------------------------
 
+test('names: 服务器名/备注/服务器 id 命中审核词表 → BLOCKED_TEXT（提交与改备注两条路）', async () => {
+  const { board } = makeBoard();
+
+  const badName = await board.add(addInput({ serverName: 'fuck 服' }), T0);
+  assert.equal(badName.ok, false);
+  assert.equal(badName.error, 'BLOCKED_TEXT');
+
+  const badId = await board.add(addInput({ serverId: '傻逼' }), T0);
+  assert.equal(badId.error, 'BLOCKED_TEXT');
+
+  const badNote = await board.add(addInput({ note: 'аsshole' }), T0);   // 西里尔同形字
+  assert.equal(badNote.error, 'BLOCKED_TEXT');
+
+  // 干净的名字/备注照常通过（不许误伤）
+  const ok = await board.add(addInput({ serverName: '站长服务', note: '缺两人，速来' }), T0);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.added.note, '缺两人，速来');
+
+  // 改备注走同一道闸
+  const patchBad = await board.update({ code: 'ABCD', serverId: 'srv-a', token: ok.token, note: 'f.u.c.k' }, T0 + 1_000);
+  assert.equal(patchBad.ok, false);
+  assert.equal(patchBad.error, 'BLOCKED_TEXT');
+  const patchOk = await board.update({ code: 'ABCD', serverId: 'srv-a', token: ok.token, note: '还缺一人' }, T0 + 2_000);
+  assert.equal(patchOk.ok, true);
+  assert.equal(patchOk.updated.note, '还缺一人');
+});
+
 test('visitors: distinct device keys inside the 120s window, IP fallback, expiry pruned', async () => {
   const { board } = makeBoard();
   await board.add(addInput({ note: '' }), T0);

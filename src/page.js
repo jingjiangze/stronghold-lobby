@@ -891,6 +891,8 @@ export const PAGE_HTML = `<!doctype html>
       case 'BAD_SERVER': return '服务器名不可用（本机服务 / 自动 这类占位名不能提交）';
       case 'BAD_URL': return '房间地址不可用：需为 https 公网地址，可留空';
       case 'BAD_JSON': return '提交内容过大或格式有误';
+      // v7.1：与服务端同一份策略/词表（src/names.js 的 BLOCKED_TEXT_HINT）——page.test.mjs 断言两者一致
+      case 'BLOCKED_TEXT': return '内容含违规词，换一个吧';
       case 'DEBOUNCED': return '这个房号刚刚提交过，30 秒后再试';
       case 'RATE_LIMITED': return '提交太频繁了，请过一会儿再试';
       case 'LIMIT_REACHED': return '你名下未过期的房间已达上限（5 条），先销毁几条再提交';

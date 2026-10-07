@@ -71,6 +71,7 @@ tools/apk/lobby-worker/
 - 「加入」目标 = 房间行自己的 `url`（https + 公网主机校验，与服务端 `board.js` deny 表逐条对齐；不合法回落官方网页入口 `https://weishu.jiangjiangze.icu/`），拼 `?room=CODE`——与客户端深链同一约定；
 - 难度中文名 `标准/险境/绝境/终极`（与 APK 面板 `MATCH_DIFFS` 同表）；服务器名原样展示（不隐藏）；
 - **提交房间**（默认折叠，页头「＋ 提交房间」展开）：**房间链接必填（要带邀请码）、其余全选填** → 同源 `POST /api/rooms`；
+  - **审核**：服务器名 / 服务器 id / 备注入库前过一道违规词表（同形字、全角、`f.u.c.k` 分隔符、`f4ck` leet、组合记号都能拦；`class`/`assassin` 这类正常词不误伤）；命中整条拒绝并回 `BLOCKED_TEXT`，页面提示「内容含违规词，换一个吧」。审核是过滤器不是保证，词表见 `src/names-words.js`（扩充只改这个文件）。
   - **链接是唯一必填项**：形如 `https://服务器/?room=ABCD`（生态里 weishu / rainya / lunar 的房间链接都是这个形状）；
   - **房号从链接里读**（`codeFromLink`：只认 `?room=` 参数、必须本身就是干净的 4 位 `[A-HJ-NP-Z]`，不猜不截断），输入时实时回显在「房号（从链接识别）」框里；把房号本身粘进链接框会明确提示「这是房号、不是链接」；
   - 链接必须 https + 公网主机（与「加入」同一张 deny 表；只做静态校验、**不发任何请求**），长度 ≤512；
@@ -106,6 +107,7 @@ tools/apk/lobby-worker/
 | `BAD_CODE` | 400 | code 缺失/不符合 `^[A-HJ-NP-Z]{4}$` |
 | `BAD_SERVER` | 400 | serverId / serverName 缺失、纯控制字符、超长，或命中保留字（`sp-phone-host` / `local` / `auto`，trim + 大小写不敏感） |
 | `BAD_URL` | 400 | url 非字符串 / 非 http(s) / 带 userinfo / >512 字符 / host 命中拒绝表（队列的房号 url 同表） |
+| `BLOCKED_TEXT` | 400 | **v7.1 审核**：serverId / serverName / note 命中违规词表（策略 `src/names.js`，词表 `src/names-words.js`）——提交与改备注两条路同判 |
 | `BAD_DIFFICULTY` | 400 | 队列 difficulty 不在 `FUNNY/NORMAL/HARD/ABYSS` |
 | `BAD_VENUE` | 400 | 队列 `venue.kind` 非法，或 public 场地缺 `serverId` |
 | `BAD_ID` | 400 | 队列句柄 `id`（或 token）缺失 |
@@ -162,6 +164,10 @@ node --test        # 全仓（board / relay / match / page）
 测试用内存适配器直测核心，并断言**全局 fetch 调用数为 0**（房间牌路由零出站；社区源中转走 lobby-relay.test.mjs 单独验证，仅允许三个常量上游）。覆盖：契约形状与 rainya 兼容字段、TTL/leftSec/过期清理、限流三条（IP 频次 / code 防抖 / IP 条目上限）、token 销毁（成功 / 错误 token / 不存在）、note 清洗与长度、备注编辑 PATCH（成功改备注 / 错误 token / 错误 serverId / 不存在或过期 / 不刷新 TTL / 其它字段不动）、保留字拦截（`sp-phone-host` / `local` / `auto`，含大小写与 trim 变体；相似 id 回归）、difficulty 白名单（`hard` → `HARD`；非法值静默忽略且提交成功）、url 校验（含 `127.0.0.1`、`10.0.0.1`、`[::1]`、`0x7f000001`、userinfo、超长 → 拒绝且不落盘）、适配层 CORS/状态码/DO 往返（含 PATCH 走 X-Token、PUT 405）。
 
 前台网页（`page.test.mjs`）把内联脚本放进 `node:vm` + DOM 桩里实跑，断言**四源聚合**（`/api/rooms` + **一条合并的** `/api/community?src=rainya,lunar,rinko`；200 响应里的 `errors` 只把失败的那个源标灰、不挡别的源；归属不明（缺 `src`）的行直接丢弃；同主机同房号去重且本站优先）与渲染（排序 / 来源标签 / 按钮 / 转义 / 恶意 URL 回落 / 断网态 / 空态引导），以及**提交房间**全链：房号归一、载荷校验（保留字 / 长度 / 私网地址 / 难度白名单 / 备注截断）、错误码→中文、`POST /api/rooms` 的请求形状与 token 落盘、刷新后行上带「我的」/改备注/销毁、`DELETE` 带 `X-Token`（含 `NOT_FOUND` 清凭据 / 过期凭据被剪枝）、`PATCH` 只动 note、已知服务器从房间牌推导。
+
+## 第三方组件
+
+- **LDNOOBW**（List of Dirty, Naughty, Obscene, and Otherwise Bad Words）—— `src/names-words.js` 的英文词表，许可 [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/)（中文词表为本仓自建）。
 
 ## 部署
 

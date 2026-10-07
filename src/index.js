@@ -237,6 +237,7 @@ function statusFor(error) {
     case 'BAD_DIFFICULTY':
     case 'BAD_VENUE':
     case 'BAD_ID':
+    case 'BLOCKED_TEXT':   // v7.1：服务器名/备注命中审核词表
       return 400;
     case 'FORBIDDEN':
       return 403;

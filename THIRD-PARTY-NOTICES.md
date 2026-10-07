@@ -28,7 +28,7 @@ The Spine Runtimes License requires, among other things, that redistributions in
 integration is covered by the Spine Editor License Agreement — read it before redistributing. To allow the combination
 at all, this project grants an additional permission under GPL-3.0 section 7 for linking with the Spine Runtimes (see
 [NOTICE.md](NOTICE.md)).
-
+| [LDNOOBW — List of Dirty, Naughty, Obscene, and Otherwise Bad Words](https://github.com/LDNOOBW/List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words) | master (2026-10-07) | [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) | 房间牌文本审核的英文词表 — `src/names-words.js`（引擎 `src/names.js` 不含词） | yes（`src/names-words.js`） | yes（随 Worker 代码） |
 ## Fonts
 
 | Font | Licence | How it gets here |

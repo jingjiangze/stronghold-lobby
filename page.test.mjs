@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 
 import { PAGE_HTML } from './src/page.js';
+import { BLOCKED_TEXT_HINT } from './src/names.js';
 
 function makeEl(id) {
   return {
@@ -139,6 +140,12 @@ const COMMUNITY_LUNAR = {
   code: 'LLLL', server: 'Lunar', serverName: 'Lunar', serverId: 'lunar', occupied: 3, capacity: 4,
   url: 'https://stronghold.lunar.ag/?room=LLLL', leftSec: 600, live: true, status: 'waiting', note: '房主：阿米娅',
 };
+
+test('page: 审核被拒的中文提示与策略模块一致（防漂移）', async () => {
+  const { api } = await runPage({ ok: true, now: NOW, rooms: [] });
+  assert.equal(api.errorText('BLOCKED_TEXT'), BLOCKED_TEXT_HINT);
+  assert.match(PAGE_HTML, /内容含违规词/, '页面内联脚本里也要有这条文案（单文件页不能 import 模块）');
+});
 
 test('page: renders joinable first, 观战 for in-match, disabled 满员, escaped notes', async () => {
   const { list, els } = await runPage({ ok: true, now: NOW, ttlSec: 600, visitors: 7, rooms: [ROOM_FULL, ROOM_LIVE, ROOM_OPEN, ROOM_HOSTILE, ROOM_NOSEAT] });
