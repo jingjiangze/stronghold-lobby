@@ -208,26 +208,69 @@ test('v7 fairness: a room-less dissolve re-queues the guests in place and drops 
   assert.equal(after.queuedSec, 40 + Math.floor((MATCH_TTL_MS + 1) / 1000),
     'their wait keeps counting from the original joinedAt (no reset)');
   assert.equal(after.requeued, 1, 'the re-queue is observable');
+  assert.equal(after.waiting, 3, 'all three guests are back');
   assert.equal((await core.status({ id: host.id, token: host.token })).state, 'expired',
     'the host who never opened the room is out');
-
-  // 原位次：新来的人与这三位组成下一局（老 joinedAt 让他们仍是队首）
-  const next = await join(core, 'HARD', 'public', 'stronghold', '10.1.0.8');
-  assert.equal(next.state, 'matched');
-  assert.equal(next.role, 'host');
-  const memberIds = (await core.status({ id: next.id, token: next.token })).members.map((m) => m.id).sort();
-  assert.deepEqual(memberIds, [g1.id, g2.id, g3.id, next.id].sort(), 'the three re-queued guests are in the next match');
 });
 
-test('v7 fairness: the re-queue refreshes the TTL but never the position, and it is capped', async () => {
+test('v7 fairness: a re-queue that completes a group matches immediately (no wait for the next join)', async () => {
+  const { core, clock } = makeHarness();
+  const g1 = await join(core, 'NORMAL', 'local', '', '10.4.0.1');
+  const g2 = await join(core, 'NORMAL', 'local', '', '10.4.0.2');
+  const g3 = await join(core, 'NORMAL', 'local', '', '10.4.0.3');
+  const host = await join(core, 'NORMAL', 'public', 'stronghold', '10.4.0.9');
+  assert.equal(host.state, 'matched');
+  // 另一个人在匹配还活着的时候排队（TTL 90s，所以必须排在解散前不久，否则它会先过期）
+  clock.t += MATCH_TTL_MS - 20_000;
+  const solo = await join(core, 'NORMAL', 'local', '', '10.4.0.4');
+  assert.equal(solo.state, 'waiting');
+  clock.t += 20_001;
+
+  // 解散 + 放回 + 成组必须在**同一次** sweep 里完成：放回的三位正好补齐 solo
+  const swept = await core.sweep();
+  assert.equal(swept.matches.length, 1, 'the re-queued guests + the waiting solo form a group right away');
+  assert.deepEqual(swept.matches[0].members.map((m) => m.id).sort(), [g1.id, g2.id, g3.id, solo.id].sort());
+  assert.equal((await core.status({ id: g1.id, token: g1.token })).state, 'matched',
+    'a re-queued guest can be matched without anyone else joining');
+});
+
+test('v7 fairness: FIFO survives the re-queue (older re-queued guests beat newer rivals)', async () => {
   const { core, clock } = makeHarness();
   const g1 = await join(core, 'ABYSS', 'local', '', '10.2.0.1');
   const g2 = await join(core, 'ABYSS', 'local', '', '10.2.0.2');
   const g3 = await join(core, 'ABYSS', 'local', '', '10.2.0.3');
+  clock.t += 10_000;
+  const host = await join(core, 'ABYSS', 'public', 'stronghold', '10.2.0.9');
+  assert.equal(host.state, 'matched');
+  // 一个客人先退出 → 解散时只有两位客人被放回（这样 5 人竞争才能分辨顺序）
+  assert.equal((await core.cancel({ id: g3.id, token: g3.token })).removed, 'member');
+
+  clock.t += 100_000;
+  const r1 = await join(core, 'ABYSS', 'local', '', '10.2.1.1'); // 三位竞争者：晚于客人进队
+  const r2 = await join(core, 'ABYSS', 'local', '', '10.2.1.2');
+  const r3 = await join(core, 'ABYSS', 'local', '', '10.2.1.3');
+  assert.equal(r1.state, 'waiting');
+  assert.equal(r2.state, 'waiting');
+  assert.equal(r3.state, 'waiting');
+
+  clock.t += 80_000;                        // 匹配到点：解散 + 放回 + 成组在同一次 sweep 完成
+  const guest = await core.status({ id: g1.id, token: g1.token });
+  assert.equal(guest.state, 'matched', 'the older re-queued guests fill the group');
+  assert.deepEqual(guest.members.map((m) => m.id).sort(), [g1.id, g2.id, r1.id, r2.id].sort(),
+    'the two re-queued guests + the two OLDER rivals (FIFO)');
+  assert.equal((await core.status({ id: r3.id, token: r3.token })).state, 'waiting',
+    'the newest rival does not jump the queue');
+});
+
+test('v7 fairness: the re-queue refreshes the TTL but never the position, and it is capped', async () => {
+  const { core, clock } = makeHarness();
+  const g1 = await join(core, 'ABYSS', 'local', '', '10.3.0.1');
+  const g2 = await join(core, 'ABYSS', 'local', '', '10.3.0.2');
+  const g3 = await join(core, 'ABYSS', 'local', '', '10.3.0.3');
 
   // 反复「凑齐 → 房主不建房 → 解散」，客人的 joinedAt 不动、TTL 每次重算
   for (let round = 1; round <= MAX_REQUEUES; round++) {
-    const host = await join(core, 'ABYSS', 'public', 'stronghold', `10.2.9.${round}`);
+    const host = await join(core, 'ABYSS', 'public', 'stronghold', `10.3.9.${round}`);
     assert.equal(host.state, 'matched', `round ${round}: grouped`);
     clock.t += MATCH_TTL_MS + 1;
     const st = await core.status({ id: g1.id, token: g1.token });
@@ -236,7 +279,7 @@ test('v7 fairness: the re-queue refreshes the TTL but never the position, and it
   }
 
   // 超过上限：不再放回，客人拿到 expired（不再无限循环）
-  const lastHost = await join(core, 'ABYSS', 'public', 'stronghold', '10.2.9.99');
+  const lastHost = await join(core, 'ABYSS', 'public', 'stronghold', '10.3.9.99');
   assert.equal(lastHost.state, 'matched');
   clock.t += MATCH_TTL_MS + 1;
   assert.equal((await core.status({ id: g1.id, token: g1.token })).state, 'expired',
