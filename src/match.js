@@ -188,8 +188,11 @@ export function createMatch({ state, now, random } = {}) {
     : Number.isFinite(now) ? () => Number(now) : () => Date.now();
   const at = (nowArg) => (Number.isFinite(nowArg) ? Number(nowArg) : clock());
 
-  /** One pass over storage: prune expired entries/matches/op-windows. @returns {Promise<{queue: object[], matches: object[], pending: boolean}>} */
-  async function sweep(t) {
+  /** One pass over storage: prune expired entries/matches/op-windows.
+   *  v7：时间参数缺省时取时钟 —— 导出的 sweep() 不带参时原来 t=undefined，任何比较都为 false（什么都不清理）。
+   *  @returns {Promise<{queue: object[], matches: object[], pending: boolean}>} */
+  async function sweep(nowArg) {
+    const t = at(nowArg);
     const listed = await state.list();
     const pairs = listed instanceof Map
       ? listed.entries()
@@ -251,10 +254,17 @@ export function createMatch({ state, now, random } = {}) {
     }
     for (const key of dead) await state.delete(key);
     // v7：把解散的客人放回队列（容量上限内；满了就只能让他们走正常重排）
+    let requeuedDifficulty = '';
     for (const item of requeues) {
       if (queue.length + 1 > MAX_QUEUE) break;
       await state.put(item.key, item.entry);
       queue.push(item.entry);
+      requeuedDifficulty = item.entry.difficulty;
+    }
+    // v7：放回后**立即**尝试成组 —— 否则「3 个客人 + 1 个已在等的人」会干等到下一个玩家进队（Sourcery 🟠）
+    if (requeuedDifficulty) {
+      const formed = await formGroups(queue, t, requeuedDifficulty);
+      for (const m of formed) matches.push(m);
     }
     // an index pointing at a swept match is dead too
     const liveIds = new Set(matches.map((m) => m.id));
@@ -264,6 +274,52 @@ export function createMatch({ state, now, random } = {}) {
     }
     const pending = queue.length > 0 || matches.length > 0;
     return { queue, matches, pending };
+  }
+
+  /**
+   * 把某个难度的等待者按 joinedAt（同龄按 id）顺序每 GROUP_SIZE 个组成一局。
+   * v7：enqueue 与「解散放回」共用 —— 放回后必须**立即**尝试成组，否则「3 个客人 + 1 个已在等的人」
+   * 会一直干等到下一个玩家进队（Sourcery 🟠）。
+   * @param {object[]} queue 本次 sweep 的存活等待者（成组的成员会被就地摘掉）
+   * @param {number} t
+   * @param {string} [onlyDifficulty] 只处理这个难度（放回场景；不传则四个难度都过一遍）
+   * @returns {Promise<object[]>} 新成队的 match 列表
+   */
+  async function formGroups(queue, t, onlyDifficulty) {
+    const formed = [];
+    const diffs = onlyDifficulty ? [onlyDifficulty] : DIFFS;
+    for (const difficulty of diffs) {
+      let bucket = queue
+        .filter((e) => e.difficulty === difficulty)
+        .sort((a, b) => a.joinedAt - b.joinedAt || (a.id < b.id ? -1 : 1));
+      while (bucket.length >= GROUP_SIZE) {
+        const members = bucket.slice(0, GROUP_SIZE);
+        bucket = bucket.slice(GROUP_SIZE);
+        const host = members.find((m) => m.venue && m.venue.kind === 'public') || members[0];
+        const match = {
+          id: makeHex(random, ID_BYTES),
+          difficulty,
+          hostId: host.id,
+          // v7：requeues 要跟着条目一起进 match —— 否则解散放回时计数永远从 0 起算，上限形同虚设
+          members: members.map((m) => ({
+            id: m.id, token: m.token, venue: m.venue, app: m.app, ip: m.ip,
+            joinedAt: m.joinedAt, requeues: m.requeues,
+          })),
+          room: null,
+          createdAt: t,
+          expiresAt: t + MATCH_TTL_MS,
+        };
+        await state.put(M + match.id, match);
+        for (const m of members) {
+          await state.put(I + m.id, match.id);
+          await state.delete(Q + m.id);
+          const at = queue.indexOf(m);
+          if (at >= 0) queue.splice(at, 1);
+        }
+        formed.push(match);
+      }
+    }
+    return formed;
   }
 
   /** Per-IP sliding window over accepted POST/DELETE ops. */
@@ -317,36 +373,14 @@ export function createMatch({ state, now, random } = {}) {
       expiresAt: t + QUEUE_TTL_MS, // v7：TTL 与排序分开（放回队列只重算 TTL，不动位次）
     };
     await state.put(Q + entry.id, entry);
+    before.queue.push(entry);
 
     // group only waiters of the SAME difficulty; oldest first (fair), exactly GROUP_SIZE
-    const bucket = before.queue
-      .filter((e) => e.difficulty === difficulty)
-      .concat([entry])
-      .sort((a, b) => a.joinedAt - b.joinedAt || (a.id < b.id ? -1 : 1));
-    if (bucket.length >= GROUP_SIZE) {
-      const members = bucket.slice(0, GROUP_SIZE);
-      const host = members.find((m) => m.venue.kind === 'public') || members[0];
-      const match = {
-        id: makeHex(random, ID_BYTES),
-        difficulty,
-        hostId: host.id,
-        // v7：requeues 要跟着条目一起进 match —— 否则解散放回时计数永远从 0 起算，上限形同虚设
-        members: members.map((m) => ({ id: m.id, token: m.token, venue: m.venue, app: m.app, ip: m.ip, joinedAt: m.joinedAt, requeues: m.requeues })),
-        room: null,
-        createdAt: t,
-        expiresAt: t + MATCH_TTL_MS,
-      };
-      await state.put(M + match.id, match);
-      for (const m of members) {
-        await state.put(I + m.id, match.id);
-        await state.delete(Q + m.id);
-      }
-      if (members.some((m) => m.id === entry.id)) {
-        return { ...publicMatch(match, entry.id, t), token: entry.token };
-      }
-    }
+    const formed = await formGroups(before.queue, t, difficulty);
+    const mine = formed.find((m) => m.members.some((mm) => mm.id === entry.id));
+    if (mine) return { ...publicMatch(mine, entry.id, t), token: entry.token };
 
-    const waiting = bucket.length;
+    const waiting = before.queue.filter((e) => e.difficulty === difficulty).length;
     return { ...publicQueue(entry, t, waiting), token: entry.token };
   }
 
