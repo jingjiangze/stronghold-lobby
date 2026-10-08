@@ -37,8 +37,8 @@
 // (never let a 4xx/5xx poison the CDN — the negative-cache lesson). `/api/lobby` is the one endpoint
 // that mixes live board rows with relayed ones, so it caches for a much shorter 15s.
 // Error codes -> HTTP status: BAD_JSON/BAD_CODE/BAD_SERVER/BAD_URL/BAD_SRC/BAD_DIFFICULTY/BAD_VENUE/
-// BAD_ID 400, FORBIDDEN 403, NOT_FOUND 404, METHOD_NOT_ALLOWED 405, RATE_LIMITED/DEBOUNCED/
-// LIMIT_REACHED 429, INTERNAL 500.
+// BAD_ID/BAD_QUERY/BLOCKED_TEXT 400, FORBIDDEN 403, NOT_FOUND 404, METHOD_NOT_ALLOWED 405,
+// RATE_LIMITED/DEBOUNCED/LIMIT_REACHED 429, INTERNAL 500.
 
 import { createBoard, targetHostDenyReason, CODE_RE, TTL_SEC } from './board.js';
 import { createMatch } from './match.js';
