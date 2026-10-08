@@ -192,10 +192,10 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
   assert.ok(!html.includes('data-act="destroy"'), 'no destroy button without an owned token');
 });
 
-test('page: 数据来源 — 三社区源聚合、逐行来源标签、页脚标注', async () => {
+test('page: 数据来源 — 社区源聚合、逐行来源标签、页脚标注', async () => {
   const { list, els, calls } = await runPage(
     { ok: true, now: NOW, ttlSec: 600, visitors: 2, rooms: [ROOM_OPEN] },
-    { community: { rainya: [COMMUNITY_RAINYA], lunar: [COMMUNITY_LUNAR], rinko: [] } },
+    { community: { rainya: [COMMUNITY_RAINYA], lunar: [COMMUNITY_LUNAR] } },
   );
 
   const html = list.innerHTML;
@@ -211,9 +211,10 @@ test('page: 数据来源 — 三社区源聚合、逐行来源标签、页脚标
   assert.match(els.status.textContent, /已连接 · 3 个房间/);
 
   // v6：社区源**合并成一条**请求 —— 一间房牌 + 一次合并中转（36 → 12 请求/小时）。
+  // v7.2：只剩两个源（梨子湖已去掉）—— 中转仍是 1 次请求，但上游往返从 3 次降到 2 次。
   const urls = calls.map((c) => c.url);
   assert.ok(urls.includes('/api/rooms'), 'board polled');
-  assert.ok(urls.includes('/api/community?src=rainya,lunar,rinko'), 'one combined relay call');
+  assert.ok(urls.includes('/api/community?src=rainya,lunar'), 'one combined relay call, two sources');
   assert.equal(urls.filter((u) => u.startsWith('/api/community')).length, 1, 'exactly one relay call');
 });
 
@@ -223,7 +224,7 @@ test('page: 合并响应里归属不明的行会被丢弃（不会挂到错误�
     {
       fetch: (url, options) => {
         if (String(url).startsWith('/api/community')) {
-          return jsonRes({ ok: true, src: 'rainya,lunar,rinko', fetchedAt: 0, rooms: [
+          return jsonRes({ ok: true, src: 'rainya,lunar', fetchedAt: 0, rooms: [
             { code: 'KKKK', server: 'raiya', ageSec: 5, url: 'https://game.rainya.me/?room=KKKK' },          // 无 src → 丢
             { code: 'LMNP', server: 'Lunar', serverId: 'lunar', live: true, url: 'https://stronghold.lunar.ag/?room=LMNP', src: 'lunar' },
           ] });
@@ -245,7 +246,7 @@ test('page: 数据来源 — 单源不可达只在来源标注里点名，不挡
       fetch: (url, options) => {
         // 合并调用里只有 raiya 上游失败 → 200 + errors，页面只把 raiya服 标灰。
         if (String(url).startsWith('/api/community')) {
-          return jsonRes({ ok: true, src: 'rainya,lunar,rinko', fetchedAt: 0, rooms: [], errors: { rainya: 'UPSTREAM' } });
+          return jsonRes({ ok: true, src: 'rainya,lunar', fetchedAt: 0, rooms: [], errors: { rainya: 'UPSTREAM' } });
         }
         return jsonRes({ ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] });
       },
@@ -258,14 +259,15 @@ test('page: 数据来源 — 单源不可达只在来源标注里点名，不挡
   assert.match(els.status.textContent, /部分来源不可达 · 1 个房间/);
 });
 
-test('page: 数据来源 — 静态标注写全四个来源（含网站域名）', () => {
-  // 页脚「数据来源」标注：本站房间牌 + 三个社区站，站点写明白域名，链接为 https 常量。
+test('page: 数据来源 — 静态标注写全每个来源（含网站域名），梨子湖已下线', () => {
+  // 页脚「数据来源」标注：本站房间牌 + 两个社区站，站点写明白域名，链接为 https 常量。
   assert.match(PAGE_HTML, /数据来源/);
   assert.match(PAGE_HTML, /本站房间牌（玩家上报）/);
   assert.match(PAGE_HTML, /raiya服（game\.rainya\.me）/);
   assert.match(PAGE_HTML, /Lunar（stronghold\.lunar\.ag）/);
-  assert.match(PAGE_HTML, /梨子湖（卫\.rinko\.ai）/);
-  assert.match(PAGE_HTML, /href="https:\/\/xn--rlr\.rinko\.ai\/"/);
+  // v7.2：梨子湖（卫.rinko.ai）整源去掉 —— 页面里不该再有任何它的痕迹（标注、链接、标签、注释）。
+  assert.ok(!/rinko/i.test(PAGE_HTML), 'no rinko source left in the page');
+  assert.ok(!/梨子湖/.test(PAGE_HTML), 'no 梨子湖 label left in the page');
 });
 
 test('page: 合并规则 — 同房号不同主机各留一条，同主机同房号本站优先', async () => {
@@ -281,7 +283,7 @@ test('page: 合并规则 — 同房号不同主机各留一条，同主机同房
   assert.equal(badCode, null, 'I/O are not in the room-code alphabet');
   assert.equal(hostile.url, '', 'loopback url is dropped by the shared deny table');
 
-  const merged = api.mergeRooms({ board: [board, dupBoard], rainya: [], lunar: [otherHost], rinko: [] });
+  const merged = api.mergeRooms({ board: [board, dupBoard], rainya: [], lunar: [otherHost] });
   assert.equal(merged.length, 2, 'same host+code dedupes; another host keeps its own row');
   assert.equal(merged[0].src, 'board', 'board rows lead the merge');
   assert.equal(merged[0].url, 'https://weishu.jiangjiangze.icu/', 'first board row wins the dedupe');
@@ -304,7 +306,7 @@ test('page: 后台标签页不发任何请求，回到前台立刻全量刷新�
   const payload = { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] };
   const { api, calls, doc, els } = await runPage(payload, {
     hidden: true,
-    community: { rainya: [COMMUNITY_RAINYA], lunar: [], rinko: [] },
+    community: { rainya: [COMMUNITY_RAINYA], lunar: [] },
   });
   assert.equal(calls.length, 0, 'hidden tab: no board poll, no relay poll');
   assert.equal(els.status.textContent, '', 'no render happened — the page stays on its static loading state');
@@ -316,6 +318,30 @@ test('page: 后台标签页不发任何请求，回到前台立刻全量刷新�
   assert.equal(polls.length, 2, 'one full refresh = board + one combined relay');
   assert.match(els.list.innerHTML, /AAAA/);
   assert.match(els.list.innerHTML, /KKKK/, "community rows come along on the refresh");
+});
+
+test('page: 全量刷新时房间牌不等社区中转（中转要替上游付往返，不该拖慢本站牌面）', async () => {
+  const payload = { ok: true, now: NOW, ttlSec: 600, visitors: 1, rooms: [ROOM_OPEN] };
+  let releaseRelay = null;
+  const gate = new Promise((resolve) => { releaseRelay = resolve; });
+  const { api, els } = await runPage(payload, {
+    fetch: (url) => {
+      if (String(url).startsWith('/api/community')) {
+        return gate.then(() => jsonRes({ ok: true, src: 'rainya,lunar', fetchedAt: 0, rooms: [{ ...COMMUNITY_RAINYA, src: 'rainya' }] }));
+      }
+      return jsonRes(payload);
+    },
+  });
+
+  els.list.innerHTML = '';            // 只看 load() 这一次自己画了什么（boot 的渲染已清掉）
+  const pending = api.load();         // 不 await：社区中转还挂在网关上
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.match(els.list.innerHTML, /AAAA/, 'board rows render as soon as the board answers');
+  assert.ok(!/KKKK/.test(els.list.innerHTML), 'the relay has not answered yet');
+
+  releaseRelay();
+  await pending;
+  assert.match(els.list.innerHTML, /KKKK/, 'relay rows land when they arrive');
 });
 
 test('page: 轮询节奏守住额度下限（房间牌 60s、社区源 300s，与 APK 面板同档）', async () => {

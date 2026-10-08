@@ -8,12 +8,13 @@
 //
 // DATA SOURCES (the page annotates each of them on the board and in the footer):
 //   board  — this Worker's own room board, GET /api/rooms (players submit from here or the app)
-//   rainya — game.rainya.me        ┐
-//   lunar  — stronghold.lunar.ag   ├ read-only community stations, relayed by GET /api/community
-//   rinko  — 卫.rinko.ai (梨子湖)  ┘ (their upstreams send no CORS headers; the relay is the door)
+//   rainya — game.rainya.me        ┐ read-only community stations, relayed by GET /api/community
+//   lunar  — stronghold.lunar.ag   ┘ (their upstreams send no CORS headers; the relay is the door)
+// 梨子湖（卫.rinko.ai）2026-10-08 已从本页聚合里去掉：它常年零房间，只让每次中转多付一次上游往返
+// （中转接口本身仍收 `rinko` 键，给已安装的 APK 面板用；见 src/index.js）。
 // The board polls every 60 s and the community relay every 300 s — the same cadence as the app's
 // lobby panel (its BOARD_REFRESH_MS / COMMUNITY_REFRESH_MS), which is the quota discipline for the
-// free tier: one visible tab costs 96 Worker requests an hour (60 board + 36 relay) and at most
+// free tier: one visible tab costs 72 Worker requests an hour (60 board + 12 relay) and at most
 // 60 DO row writes (the server-side heartbeat throttle). Both timers stay silent while the tab is
 // hidden. Rows carry a source tag so every room states where it came from; joinable rooms get a
 // 加入 button, in-match rooms get 观战 (the client auto-spectates on `?room=CODE&spectate=1` —
@@ -524,8 +525,7 @@ export const PAGE_HTML = `<!doctype html>
       <p class="lobby-src" id="src-note">
         <span class="micro micro--mint">数据来源</span>本站房间牌（玩家上报） ·
         <a href="https://game.rainya.me/" target="_blank" rel="noopener noreferrer" title="raiya 服">raiya服（game.rainya.me）</a> ·
-        <a href="https://stronghold.lunar.ag/" target="_blank" rel="noopener noreferrer" title="Lunar 服">Lunar（stronghold.lunar.ag）</a> ·
-        <a href="https://xn--rlr.rinko.ai/" target="_blank" rel="noopener noreferrer" title="梨子湖（卫.rinko.ai）">梨子湖（卫.rinko.ai）</a><span id="src-state"></span><br />
+        <a href="https://stronghold.lunar.ag/" target="_blank" rel="noopener noreferrer" title="Lunar 服">Lunar（stronghold.lunar.ag）</a><span id="src-state"></span><br />
         社区房间由各站自行维护、本站只读转发；行上的来源标签可以点开对应站点，「加入」会打开房间所在站点。<br />
         行上没有房间人数时，本站会直接向该服读一次公开的聚合数字（<code>/healthz</code>，只读、不带任何你的信息），
         并用「服务器级」标出层级；读不到就不显示，绝不推算。
@@ -547,11 +547,12 @@ export const PAGE_HTML = `<!doctype html>
   'use strict';
   // 房间牌 60s 一跳、社区源 300s —— **与 APK 面板同一档**（extras/public/js/lobby.js 的
   // BOARD_REFRESH_MS / COMMUNITY_REFRESH_MS）。额度账（免费额度：Workers 10 万请求/天）：
-  // 一个**可见**标签页每小时 = 60 次房间牌 + **12 次合并中转**（三源一次拉，v6）= **72 次请求**；
+  // 一个**可见**标签页每小时 = 60 次房间牌 + **12 次合并中转**（两源一次拉，v6）= **72 次请求**；
   // 最初 20s/180s/三源分开的时代是 240 次。**后台**标签页两个定时器都不发请求（见下），
   // 服务端访客心跳另有 60s 写节流（board.js VISIT_WRITE_MIN_MS，已是 120s 计数窗口下能压到的极限）。
   // 再往下：wrangler.toml 的 [cache] enabled（Workers Cache）让本页 HTML（max-age=60）与合并中转
-  // （s-maxage=60）命中边缘缓存时**根本不触发这个 Worker** —— 并发访客共享同一次调用；
+  // （s-maxage=120 + stale-while-revalidate=600，v7.2 起）命中边缘缓存时**根本不触发这个 Worker**，
+  // 且中转在后台过期时先把旧副本回给访客、再去上游刷新 —— 并发访客共享同一次调用、且不用等上游；
   // /api/rooms 是 no-store，永远 BYPASS（房间牌必须实时，访客计数也依赖它每次都进 DO）。
   var POLL_MS = 60000;
   var COMMUNITY_POLL_MS = 300000;
@@ -570,15 +571,16 @@ export const PAGE_HTML = `<!doctype html>
   var RESERVED_SERVERS = { 'sp-phone-host': 1, local: 1, auto: 1 };
 
   // 大厅数据来源（页面「数据来源」标注、房间行来源标签与此表同源）。
-  // board = 本站房间牌（GET /api/rooms）；其余三源经本站 Worker 中转（GET /api/community?src=…），
-  // 因为上游三家都不发 CORS 头、浏览器直连必被拦。site 只用于标注与「来源标签」链接。
+  // board = 本站房间牌（GET /api/rooms）；其余两源经本站 Worker 中转（GET /api/community?src=…），
+  // 因为上游两家都不发 CORS 头、浏览器直连必被拦。site 只用于标注与「来源标签」链接。
+  // v7.2：表里只留真正会出房间的两家 —— 已下线的第三家（见文件头 DATA SOURCES）删干净，
+  // 它常年零房间，只是让每次中转多付一次上游往返。
   var SOURCE_SITES = {
     board:  { label: '本站',    site: '',                                 host: '' },
     rainya: { label: 'raiya服', site: 'https://game.rainya.me/',           host: 'game.rainya.me' },
     lunar:  { label: 'Lunar',   site: 'https://stronghold.lunar.ag/',      host: 'stronghold.lunar.ag' },
-    rinko:  { label: '梨子湖',  site: 'https://xn--rlr.rinko.ai/',         host: '卫.rinko.ai' },
   };
-  var SOURCE_ORDER = ['board', 'rainya', 'lunar', 'rinko'];
+  var SOURCE_ORDER = ['board', 'rainya', 'lunar'];
 
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
     return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
@@ -699,7 +701,7 @@ export const PAGE_HTML = `<!doctype html>
     try { return new URL(href).origin + '/'; } catch (e) { return ''; }
   }
 
-  /** 一行房间 → 页面统一形状（board / rainya / lunar / rinko 四种来源行共用）；不合法返回 null。 */
+  /** 一行房间 → 页面统一形状（board / rainya / lunar 三种来源行共用）；不合法返回 null。 */
   function shapeRoom(raw, srcKey) {
     if (!raw || typeof raw !== 'object') return null;
     var code = String(raw.code || raw.roomId || '').toUpperCase();
@@ -731,7 +733,8 @@ export const PAGE_HTML = `<!doctype html>
     };
   }
 
-  /** 合并四源（本站优先，其次 rainya → lunar → rinko）；去重键 = 主机/服务器 + 房号。 */
+  /** 合并三源（本站优先，其次 rainya → lunar）；去重键 = 主机/服务器 + 房号。
+   *  与服务端 src/merge.js 的 mergeLobbyRooms 是同一条规则（单文件页不能 import，改一处要改两处）。 */
   function mergeRooms(lists) {
     var seen = {}, out = [];
     SOURCE_ORDER.forEach(function (key) {
@@ -794,7 +797,7 @@ export const PAGE_HTML = `<!doctype html>
       var ra = rank(a), rb = rank(b);
       if (ra !== rb) return ra - rb;                                         // 可加入 → 可观战 → 满员
       var aa = ageSecOf(a, now), bb = ageSecOf(b, now);
-      // 同组内最新在前；没有时间戳的实时源行（lunar / rinko 常驻房间）排在本组末尾。
+      // 同组内最新在前；没有时间戳的实时源行（lunar 常驻房间）排在本组末尾。
       if (aa < 0 && bb >= 0) return 1;
       if (bb < 0 && aa >= 0) return -1;
       if (aa >= 0 && bb >= 0) return aa - bb;
@@ -1025,19 +1028,19 @@ export const PAGE_HTML = `<!doctype html>
     });
   }
 
-  // ---- 数据拉取（四源） ---------------------------------------------------------------
+  // ---- 数据拉取（三源） ---------------------------------------------------------------
   // 每一源：{ state: 'loading'|'ok'|'error', at, list }；一行抓挂只影响这一源的标注，绝不挡住别的源。
   var sources = {
     board:  { state: 'loading', at: 0, list: [] },
     rainya: { state: 'loading', at: 0, list: [] },
     lunar:  { state: 'loading', at: 0, list: [] },
-    rinko:  { state: 'loading', at: 0, list: [] },
   };
   var visitors = null;
 
-  /** 三源合并中转（v6）：一次请求拉全部社区源 —— 36 → 12 请求/小时/可见标签页。
-   *  响应里每行带 src；某个源挂了落在 errors，只有那个源变灰，其它源照常。 */
-  var COMMUNITY_KEYS = ['rainya', 'lunar', 'rinko'];
+  /** 社区源合并中转（v6）：一次请求拉全部社区源 —— 36 → 12 请求/小时/可见标签页。
+   *  响应里每行带 src；某个源挂了落在 errors，只有那个源变灰，其它源照常。
+   *  v7.2：下线的第三家去掉后只剩两家（上游往返从 3 次降到 2 次，中转本身仍是 1 次请求）。 */
+  var COMMUNITY_KEYS = ['rainya', 'lunar'];
   var COMMUNITY_URL = '/api/community?src=' + COMMUNITY_KEYS.join(',');
 
   function fetchBoard() {
@@ -1071,7 +1074,7 @@ export const PAGE_HTML = `<!doctype html>
       });
   }
 
-  /** 整个合并调用失败 → 三个社区源一起标记不可达（与旧的逐源失败语义一致）。 */
+  /** 整个合并调用失败 → 全部社区源一起标记不可达（与旧的逐源失败语义一致）。 */
   function pullCommunity() {
     return fetchCommunityAll().catch(function () {
       var at = Date.now();
@@ -1083,9 +1086,13 @@ export const PAGE_HTML = `<!doctype html>
     return fetchBoard().catch(function () { sources.board = { state: 'error', at: Date.now(), list: [] }; });
   }
 
-  /** 全量刷新（初次进入 / 提交房间后 / 回到前台）。 */
+  /** 全量刷新（回到前台 / 提交房间后）：**每个源各自落地就重画**，房间牌不等社区中转 ——
+   *  中转要替两家上游付往返（冷缓存时 ~1s 起），等它会把本站房间牌的显示也一起拖慢。 */
   function load() {
-    return Promise.all([pullBoard(), pullCommunity()]).then(function () { render(); });
+    return Promise.all([
+      pullBoard().then(function () { render(); }),
+      pullCommunity().then(function () { render(); }),
+    ]);
   }
 
   function loadBoard() {
@@ -1315,7 +1322,7 @@ export const PAGE_HTML = `<!doctype html>
     var now = Date.now();
     var rooms = sortRooms(mergeRooms({
       board: sources.board.list, rainya: sources.rainya.list,
-      lunar: sources.lunar.list, rinko: sources.rinko.list,
+      lunar: sources.lunar.list,
     }), now);
     probeKick(rooms); // C：行上缺房间级数字时，顺路读一眼那个服的 /healthz（公开只读聚合数字）
     var mine = liveMine();
