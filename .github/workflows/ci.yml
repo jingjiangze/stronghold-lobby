@@ -23,5 +23,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '${{ matrix.node }}'
-      - name: Unit tests (board / relay / match-queue)
+      - name: Unit tests (board / relay / api / match / page)
         run: node --test

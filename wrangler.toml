@@ -13,9 +13,15 @@ workers_dev = true
 
 # Workers Cache（2026-10-07）：让本 Worker 的响应参与 CF 边缘缓存 —— 命中时**不再触发 Worker**
 # （真正的额度省法：并发访客共享同一次调用）。缓存语义完全由响应头决定：
-#   /             → public, max-age=60   → 缓存 60s
-#   /api/community → public, max-age=10, s-maxage=60 → 缓存 60s（部分失败 10s）
-#   /api/rooms 等 → no-store             → 永不缓存（房间牌必须实时）
+#   /              → public, max-age=60                    → 缓存 60s
+#   /api           → public, max-age=3600                  → 端点索引，长缓存
+#   /api/community → public, max-age=10, s-maxage=120,
+#                    stale-while-revalidate=600            → 缓存 120s（部分失败 10s）
+#   /api/lobby     → public, max-age=5, s-maxage=15,
+#                    stale-while-revalidate=60             → 缓存 15s（带实时房间牌）
+#   /api/rooms 等  → no-store                              → 永不缓存（房间牌必须实时）
+# v7.2（2026-10-08）：中转 s-maxage 60 → 120 并加 SWR —— 页面每 300s 才拉一次，60s 的缓存
+# 意味着每次轮询都是 MISS、每个访客都替上游付一次往返。见 README「抓取链路与缓存」。
 # cross_version_cache 关闭（默认）：换版本即失效，避免旧响应跨版本残留。
 [cache]
 enabled = true

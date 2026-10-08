@@ -8,6 +8,10 @@
 // ROUTES
 //   OPTIONS *              CORS preflight (204)
 //   GET  /                 the public lobby page (src/page.js) — live room board, join/spectate
+//   GET  /api              self-describing endpoint index — the entry point other clients start from
+//   GET  /api/lobby        **ONE-CALL LOBBY**: board + community merged/deduped/sorted, every row
+//                          tagged with `src` — for other clients (bots, sites, other APK builds)
+//                          that do not want to implement the relay + merge themselves
 //   GET  /api/rooms        rainya-shaped board: { ok, now, ttlSec:600, rooms:[...] }
 //   POST /api/rooms        JSON { code, serverId, serverName, note?, url?, difficulty? } -> 201 { ok, added, token }
 //   PATCH /api/rooms       JSON { code, serverId, note }  header X-Token      -> 200 { ok, updated }
@@ -15,25 +19,30 @@
 //   DELETE /api/rooms?code=&serverId=      header X-Token: <token>          -> 200 { ok, removed }
 //   GET  /api/community?src=rainya|lunar|rinko   relayed { ok, src, fetchedAt, rooms:[...] }
 //        v6: `src` also accepts a comma list (1..3 whitelist keys, order preserved, deduped):
-//        `?src=rainya,lunar,rinko` answers once for all of them — rows get a per-row `src`, a source
-//        that fails lands in `errors:{<key>:'UPSTREAM'}` instead of failing the whole call (all three
-//        failing is still a 502). The lobby page uses the combined form: one request per cycle
+//        `?src=rainya,lunar` answers once for all of them — rows get a per-row `src`, a source
+//        that fails lands in `errors:{<key>:'UPSTREAM'}` instead of failing the whole call (all of
+//        them failing is still a 502). The lobby page uses the combined form: one request per cycle
 //        instead of three (96 → 72 requests/hour per visible tab).
+//        v7.2: 梨子湖（rinko）已从**页面**的聚合里去掉（它常年零房间，纯成本）；中转仍收 `rinko`
+//        这个键，因为已安装的 APK 面板是按单源 `?src=rinko` 拉取的 —— 去掉键会让那些面板永久显示
+//        「梨子湖暂不可达」。页面只发 `?src=rainya,lunar`（规范拼写 → 唯一缓存键）。
 //   GET  /api/match?id=<handle>            queue/match status for one searcher
 //   POST /api/match {difficulty, venue:{kind, serverId?}}    join the cross-server match queue
 //   POST /api/match/room {id, code, serverId, url?}          header X-Token — the HOST posts the room
 //   DELETE /api/match?id=<handle>          header X-Token — leave the queue / drop out of a match
 //   GET  /api/health       { ok:true, now } — stateless liveness probe for deploy self-check
 // Board responses carry `cache-control: no-store`; the community relay's 200 uses
-// `public, max-age=10, s-maxage=60` (partial answers 10) so a zone Cache Rule can serve repeat
-// polls from the edge without invoking this Worker, while every error path stays `no-store`
-// (never let a 4xx/5xx poison the CDN — the negative-cache lesson).
+// `public, max-age=10, s-maxage=120, stale-while-revalidate=600` (partial answers 10) so the edge
+// can serve repeat polls without invoking this Worker, while every error path stays `no-store`
+// (never let a 4xx/5xx poison the CDN — the negative-cache lesson). `/api/lobby` is the one endpoint
+// that mixes live board rows with relayed ones, so it caches for a much shorter 15s.
 // Error codes -> HTTP status: BAD_JSON/BAD_CODE/BAD_SERVER/BAD_URL/BAD_SRC/BAD_DIFFICULTY/BAD_VENUE/
 // BAD_ID 400, FORBIDDEN 403, NOT_FOUND 404, METHOD_NOT_ALLOWED 405, RATE_LIMITED/DEBOUNCED/
 // LIMIT_REACHED 429, INTERNAL 500.
 
 import { createBoard, targetHostDenyReason, CODE_RE, TTL_SEC } from './board.js';
 import { createMatch } from './match.js';
+import { mergeLobbyRooms, sortLobbyRooms, LOBBY_SOURCES, MERGE_ORDER } from './merge.js';
 import { PAGE_HTML } from './page.js';
 
 /** The single DO instance name — one board for every caller (singleton semantics). */
@@ -45,9 +54,14 @@ const MATCH_OBJECT_NAME = 'match';
 const BODY_MAX = 8 * 1024;
 
 /**
- * Community relay upstreams — FROZEN constants. The three community sources send no CORS headers
+ * Community relay upstreams — FROZEN constants. The community sources send no CORS headers
  * (rainya portal OPTIONS 403; lunar/rinko OPTIONS 405), so a browser/WebView page cannot read them
  * cross-origin; this relay is the door. The client only ever sends the KEY (`src`).
+ *
+ * v7.2: `rinko`（梨子湖 / 卫.rinko.ai）已从大厅页的聚合里去掉 —— 它常年返回零房间（2026-10-08 线上
+ * 实测 `items: []`），却让每次中转多付一次上游往返。键保留在这里只为**已安装的 APK 面板**（它按
+ * 单源 `?src=rinko` 拉取，见主仓 tools/apk/extras/public/js/lobby.js）；面板换成 `?src=rainya,lunar`
+ * 之后这个键就可以整段删掉。LOBBY_SOURCES（= 页面与 /api/lobby 实际聚合的两个源）才是当前对外承诺。
  */
 const COMMUNITY_SOURCES = Object.freeze({
   rainya: Object.freeze({ url: 'https://game.rainya.me/api/rooms' }),
@@ -144,9 +158,13 @@ async function relayOne(key, env) {
   return { ok: true, rooms };
 }
 
-/** Full success is edge-cacheable for 60s (a zone Cache Rule may serve repeat polls without running
- *  this Worker); a partial answer keeps the old 10s so a recovered source is picked up quickly. */
-const RELAY_CACHE_FULL = 'public, max-age=10, s-maxage=60';
+/** Full success is edge-cacheable for 2 minutes (a zone Cache Rule / the Workers Cache may serve
+ *  repeat polls without running this Worker); a partial answer keeps the old 10s so a recovered
+ *  source is picked up quickly.
+ *  v7.2 延迟：页面每 300s 才拉一次中转，而 s-maxage 只有 60s —— 每次轮询都是 MISS，每个访客都替
+ *  上游付一次往返。现在 s-maxage=120 + stale-while-revalidate=600：边缘先回旧副本（0 往返）、
+ *  后台再去上游刷新，访客基本不再等上游（实测见 README「抓取链路与缓存」）。 */
+const RELAY_CACHE_FULL = 'public, max-age=10, s-maxage=120, stale-while-revalidate=600';
 const RELAY_CACHE_PARTIAL = 'public, max-age=10, s-maxage=10';
 /** Max sources in one combined call (there are only three; the cap keeps the URL grammar tight). */
 const RELAY_SRC_MAX = 3;
@@ -206,6 +224,101 @@ async function relayCommunity(srcParam, env) {
   return { status: 200, body, cache: failed.length ? RELAY_CACHE_PARTIAL : RELAY_CACHE_FULL };
 }
 
+/** The aggregated read API caches far shorter than the relay: it carries the LIVE room board. */
+const LOBBY_CACHE = 'public, max-age=5, s-maxage=15, stale-while-revalidate=60';
+
+/** Read the board through its DO (the same headers the GET /api/rooms path forwards, so a client
+ *  polling /api/lobby still counts as a lobby visitor). Never throws: { ok:false } on any failure. */
+async function readBoardRooms(request, env) {
+  try {
+    const headers = new Headers();
+    headers.set('x-client-ip', request.headers.get('CF-Connecting-IP') || '');
+    const dev = request.headers.get('X-Device');
+    if (dev) headers.set('x-device', dev);
+    const stub = env.BOARD.get(env.BOARD.idFromName(BOARD_OBJECT_NAME));
+    const internal = new Request('https://board.internal/api/rooms', { method: 'GET', headers });
+    const res = await stub.fetch(internal);
+    if (!res.ok) return { ok: false };
+    const body = await res.json();
+    return body && Array.isArray(body.rooms) ? { ok: true, body } : { ok: false };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * GET /api/lobby — **the whole lobby in one request**, for clients that do not want to run the relay
+ * themselves: the board (live, via its DO) plus the community sources (relayed) merged, deduped and
+ * sorted by the canonical rule (src/merge.js), every row tagged with `src`.
+ *   { ok, now, ttlSec, rooms:[{…,src}], sources:{ <key>:{ok,count} }, visitors?, errors? }
+ * A single dead source degrades to `errors` + `sources[key].ok:false` and still answers 200; only
+ * everything failing at once is a 502. No parameters are accepted (one cache key per endpoint —
+ * the same reason /api/community rejects extras); filter client-side.
+ */
+async function lobbyPayload(request, env) {
+  const [relayed, board] = await Promise.all([
+    relayCommunity(LOBBY_SOURCES.join(','), env),
+    readBoardRooms(request, env),
+  ]);
+  const relayOk = relayed.status === 200 && relayed.body && relayed.body.ok === true;
+  if (!relayOk && !board.ok) {
+    return { status: 502, body: { ok: false, error: 'UPSTREAM' }, cache: 'no-store' };
+  }
+
+  const lists = { board: [] };
+  for (const key of LOBBY_SOURCES) lists[key] = [];
+  const errors = {};
+  if (relayOk) {
+    for (const row of relayed.body.rooms || []) {
+      const key = String((row && row.src) || '');
+      if (!Object.prototype.hasOwnProperty.call(lists, key)) continue;   // 归属不明 → 丢，绝不猜
+      lists[key].push(row);
+    }
+    if (relayed.body.errors) Object.assign(errors, relayed.body.errors);
+  } else {
+    for (const key of LOBBY_SOURCES) errors[key] = 'UPSTREAM';
+  }
+  if (board.ok) lists.board = board.body.rooms;
+  else errors.board = 'UPSTREAM';
+
+  const body = {
+    ok: true,
+    now: Date.now(),
+    ttlSec: TTL_SEC,
+    rooms: sortLobbyRooms(mergeLobbyRooms(lists)),
+    sources: Object.fromEntries(MERGE_ORDER.map((key) => [key, { ok: !errors[key], count: lists[key].length }])),
+  };
+  if (board.ok && typeof board.body.visitors === 'number') body.visitors = board.body.visitors;
+  if (Object.keys(errors).length) body.errors = errors;
+  return { status: 200, body, cache: LOBBY_CACHE };
+}
+
+/** GET /api — the directory other clients start from: every public endpoint, its shape and its cache
+ *  policy. Static (no DO, no egress), so it is cached for an hour at the edge. */
+const API_INDEX = Object.freeze({
+  ok: true,
+  name: 'sp-lobby-board',
+  about: '卫戍协议：盟约 · 联机大厅（非官方同人项目）房间牌 + 跨服匹配队列',
+  page: 'https://sp-lobby.jiangjiangze.icu/',
+  docs: 'https://github.com/jingjiangze/stronghold-lobby#其他端快速接入',
+  cors: '*',
+  sources: LOBBY_SOURCES,
+  endpoints: [
+    { method: 'GET', path: '/api/lobby', summary: '整个大厅一次拿：房间牌 + 社区源合并去重排序，每行带 src', cache: 'public, max-age=5, s-maxage=15' },
+    { method: 'GET', path: '/api/rooms', summary: '本站房间牌（rainya 兼容形状）', cache: 'no-store' },
+    { method: 'POST', path: '/api/rooms', summary: '提交房间 {code,serverId,serverName,note?,url?,difficulty?}', cache: 'no-store' },
+    { method: 'PATCH', path: '/api/rooms', summary: '改备注（X-Token + serverId 双匹配）', cache: 'no-store' },
+    { method: 'DELETE', path: '/api/rooms?code=&serverId=', summary: '销毁房间（X-Token）', cache: 'no-store' },
+    { method: 'GET', path: '/api/community?src=rainya,lunar', summary: '社区源中转（白名单键，逗号列表须规范拼写）', cache: 'public, max-age=10, s-maxage=120' },
+    { method: 'GET', path: '/api/match?id=', summary: '跨服匹配队列状态', cache: 'no-store' },
+    { method: 'POST', path: '/api/match', summary: '入队 {difficulty, venue:{kind,serverId?}}', cache: 'no-store' },
+    { method: 'POST', path: '/api/match/room', summary: '房主把建好的房间挂回队列（X-Token）', cache: 'no-store' },
+    { method: 'DELETE', path: '/api/match?id=', summary: '退队 / 离开对局（X-Token）', cache: 'no-store' },
+    { method: 'GET', path: '/api/health', summary: '无状态存活探针 {ok,now}', cache: 'no-store' },
+    { method: 'GET', path: '/', summary: '公开大厅页（房间牌 / 加入 / 观战 / 提交房间）', cache: 'public, max-age=60' },
+  ],
+});
+
 
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
@@ -237,6 +350,7 @@ function statusFor(error) {
     case 'BAD_DIFFICULTY':
     case 'BAD_VENUE':
     case 'BAD_ID':
+    case 'BAD_QUERY':      // v7.2：/api/lobby 不吃参数（等价拼写会造出等价缓存键）
     case 'BLOCKED_TEXT':   // v7.1：服务器名/备注命中审核词表
       return 400;
     case 'FORBIDDEN':
@@ -432,6 +546,23 @@ export default {
       if (url.pathname === '/api/health') {
         if (method !== 'GET') return withCors(json({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405));
         return withCors(json({ ok: true, now: Date.now() })); // stateless — no DO hop
+      }
+
+      // 其他端的快速接入入口：先看这份索引（端点/形状/缓存策略），再 GET /api/lobby 一次拿全量。
+      if (url.pathname === '/api' || url.pathname === '/api/') {
+        if (method !== 'GET') return withCors(json({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405));
+        return withCors(json(API_INDEX), 'public, max-age=3600');
+      }
+
+      // 一次拿整个大厅：房间牌（DO）+ 社区源（中转）合并去重排序。**不吃任何参数** ——
+      // 多余的查询串会造出等价缓存键（绕边缘缓存、放大上游），所以直接 400。
+      if (url.pathname === '/api/lobby') {
+        if (method !== 'GET') return withCors(json({ ok: false, error: 'METHOD_NOT_ALLOWED' }, 405));
+        if ([...url.searchParams.keys()].length) {
+          return withCors(json({ ok: false, error: 'BAD_QUERY' }, 400));
+        }
+        const merged = await lobbyPayload(request, env);
+        return withCors(json(merged.body, merged.status), merged.cache);
       }
 
       if (url.pathname === '/api/community') {

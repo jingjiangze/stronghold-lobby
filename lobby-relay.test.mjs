@@ -116,6 +116,15 @@ test('src=rinko: occupied>=capacity without inMatch reports full', async () => {
   assert.equal(body.rooms[0].status, 'full');
 });
 
+test('v7.2: rinko 已从页面聚合里去掉，但中转仍收这个键（给已安装的 APK 面板）', async () => {
+  // 页面只发 ?src=rainya,lunar（见 page.test.mjs）。这里锁住「不要顺手把键也删了」：
+  // 老面板按单源 ?src=rinko 拉取，键一没就是 400，面板会永久显示「梨子湖暂不可达」。
+  const log = stubFetch(async () => jsonResponse({ items: [] }));
+  const res = await callRelay('?src=rinko');
+  assert.equal(res.status, 200, 'installed panels must keep working until they pick up the 2-source list');
+  assert.deepEqual(log.map((c) => c.url), ['https://xn--rlr.rinko.ai/api/rooms']);
+});
+
 test('whitelist: missing/unknown/duplicate/extra params are 400 BAD_SRC with ZERO outbound calls', async () => {
   const log = stubFetch(async () => jsonResponse({}));
   for (const query of ['', '?src=', '?src=nope', '?src=RAINYA', '?src=rainya&src=lunar', '?src=rainya&x=1', '?x=1', '?src=,',
@@ -183,11 +192,13 @@ test('a timeout is a 502, not a hang', async () => {
   }
 });
 
-test('a successful relay response is edge-cacheable (public, max-age=10, s-maxage=60)', async () => {
+test('a successful relay response is edge-cacheable (public, max-age=10, s-maxage=120 + SWR)', async () => {
   stubFetch(async () => jsonResponse({ rooms: [] }));
   const res = await callRelay('?src=rainya');
   assert.equal(res.status, 200);
-  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=60');
+  // v7.2：页面每 300s 才拉一次中转 —— s-maxage 必须 ≥ 这一档，否则每次轮询都是 MISS，
+  // 每个访客都替上游付一次往返。stale-while-revalidate 让边缘先回旧副本、后台再去刷新。
+  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=120, stale-while-revalidate=600');
   assert.equal(res.headers.get('access-control-allow-origin'), '*');
 });
 
@@ -213,7 +224,7 @@ test('v6 combined: ?src=rainya,lunar answers once, tags every row with its own s
   assert.equal(body.rooms[1].src, 'lunar');
   assert.equal(body.rooms[1].note, '房主：阿米娅');
   assert.equal(body.errors, undefined, 'no failed source → no errors key');
-  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=60');
+  assert.equal(res.headers.get('cache-control'), 'public, max-age=10, s-maxage=120, stale-while-revalidate=600');
   assert.deepEqual(log.map((c) => c.url).sort(), [
     'https://game.rainya.me/api/rooms',
     'https://stronghold.lunar.ag/api/rooms',
