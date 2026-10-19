@@ -18,9 +18,11 @@
 // 60 DO row writes (the server-side heartbeat throttle). Both timers stay silent while the tab is
 // hidden. Rows carry a source tag so every room states where it came from; joinable rooms get a
 // 加入 button, in-match rooms get 观战 (the client auto-spectates on `?room=CODE&spectate=1` —
-// client patch v5.6). Outbound navigation is limited to https URLs on public hosts (the same
-// scheme/deny-table spirit as the server's targetHostDenyReason), so a hostile card can never point
-// the page at loopback/private space.
+// client patch v5.6). 加入 opens exactly the URL the host submitted — one byte unchanged (v8);
+// a row whose URL is missing or fails the https/public-host check gets a disabled 无链接 button
+// instead of a jump to some other server. Outbound navigation is limited to https URLs on public
+// hosts (the same scheme/deny-table spirit as the server's targetHostDenyReason), so a hostile card
+// can never point the page at loopback/private space.
 //
 // 提交房间 (v0.2): a visitor can publish their own room to the board (POST /api/rooms, the same
 // endpoint the app's panel uses) and, while its 10-minute TTL lasts, edit the note (PATCH) or
@@ -557,8 +559,7 @@ export const PAGE_HTML = `<!doctype html>
   var POLL_MS = 60000;
   var COMMUNITY_POLL_MS = 300000;
   // v5.6 额度纪律：页面在后台标签页时两个定时器都不发请求（回到前台 visibilitychange 立刻全量刷新）。
-  // 默认加入目标：官方网页入口（只在这条房间链接不合法 / 缺失时使用）。
-  var DEFAULT_CLIENT = 'https://weishu.jiangjiangze.icu/';
+  // v8 起不再有「默认加入目标」：加入按钮只打开上报的原链接，没有链接就禁用并说明原因。
   // 本机凭据（提交房间返回的 token）：只在本源 localStorage 里，除了交回房间牌不作他用。
   var MINE_KEY = 'sp.lobby.mine';
   var NOTE_MAX = 40;
@@ -778,16 +779,23 @@ export const PAGE_HTML = `<!doctype html>
   }
 
   /**
-   * 加入 / 观战目标（v7）：**以提交的那条链接为基准**，只改 room（观战时再加 spectate）——
-   * 路径（如 rainya 的 /play）与其它查询参数都保留。链接不合法 / 没带链接才回落官方网页入口。
+   * 加入 / 观战目标（v8）：**上报时提交的那条原链接本身**，逐字节打开，不再拼任何参数。
+   *
+   * 为什么去掉 v7 的「拼 ?room=CODE」：房号是从链接里读出来的（buildPayload 的 codeFromLink），
+   * 原链接一定已经带着它；再 set 一遍对 rainya /play?room=X&src=… 这类多参数链接是净冗余。
+   * 为什么去掉回落 DEFAULT_CLIENT：那是一个具体服务器，拿别的服的房号去问它只会得到
+   * 「no such room」——链接缺失/不合格时，诚实的做法是禁用按钮并说明原因，而不是把玩家
+   * 导去一个必然 404 的地址。链接不合法时这里返回空串，由调用方渲染禁用态。
    */
   function targetFor(r, spectate) {
-    var u;
-    try { u = new URL(safeHref(r.url) || DEFAULT_CLIENT); } catch (e) { u = new URL(DEFAULT_CLIENT); }
-    u.searchParams.set('room', String(r.code || ''));
-    if (spectate) u.searchParams.set('spectate', '1');
-    else u.searchParams.delete('spectate');   // 别让链接里自带的 spectate 把「加入」变成观战
-    return u.toString();
+    var href = safeHref(r && r.url);
+    if (!href) return '';
+    if (!spectate) return href;                 // 加入 = 原链接，一个字节都不动
+    try {                                        // 观战 = 原链接 + spectate=1（客户端深链约定）
+      var u = new URL(href);
+      u.searchParams.set('spectate', '1');
+      return u.toString();
+    } catch (e) { return href; }
   }
 
   function sortRooms(rooms, now) {
@@ -1210,10 +1218,20 @@ export const PAGE_HTML = `<!doctype html>
     var badges = '<span class="room__badges">'
       + (mineEntry ? '<span class="badge is-mine">我的</span>' : '')
       + '<span class="badge is-' + st + '">' + badgeText + '</span></span>';
+    // v8：加入目标就是上报的原链接；缺失/不合格时给禁用按钮 + 说明，绝不跳到别的服务器
+    // （旧版会回落 DEFAULT_CLIENT，那是拿别人的房号去问一台只认自己房间的服 → no such room）。
+    var joinHref = targetFor(r, false), watchHref = targetFor(r, true);
+    var noLink = '<button class="btn btn--sm" disabled title="该房间上报时没有给可加入的 https 链接"><span class="btn__label">无链接</span></button>';
+    var openBtn = joinHref
+      ? '<button class="btn btn--primary btn--sm" data-href="' + esc(joinHref) + '"><span class="btn__label">加入</span></button>'
+      : noLink;
+    var liveBtn = watchHref
+      ? '<button class="btn btn--amber btn--sm" data-href="' + esc(watchHref) + '"><span class="btn__label">观战</span></button>'
+      : noLink;
     var btn = st === 'open'
-      ? '<button class="btn btn--primary btn--sm" data-href="' + esc(targetFor(r, false)) + '"><span class="btn__label">加入</span></button>'
+      ? openBtn
       : st === 'live'
-        ? '<button class="btn btn--amber btn--sm" data-href="' + esc(targetFor(r, true)) + '"><span class="btn__label">观战</span></button>'
+        ? liveBtn
         : st === 'closed'
           ? '<button class="btn btn--sm" disabled><span class="btn__label">已关闭</span></button>'
           : '<button class="btn btn--sm" disabled><span class="btn__label">满员</span></button>';

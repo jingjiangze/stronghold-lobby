@@ -161,9 +161,10 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
   assert.match(html, /5 分钟前/);   // EEEE, ageSec 300
 
   // Actions: 加入 for open rooms, 观战 for the in-match room, disabled 满员 for the full one.
-  // v7：加入目标以提交的那条链接为基准（/play 路径保留），不再被压成 origin
-  assert.match(html, /class="btn btn--primary btn--sm" data-href="https:\/\/game\.example\.com\/play\?room=AAAA"/);
-  assert.match(html, /class="btn btn--amber btn--sm" data-href="https:\/\/stronghold\.lunar\.ag\/\?room=BBBB&amp;spectate=1"/);
+  // v8：加入目标 = 上报时提交的原链接本身，逐字节（路径 / 额外参数都不动），不再拼 ?room=
+  assert.match(html, /class="btn btn--primary btn--sm" data-href="https:\/\/game\.example\.com\/play"/);
+  // 观战 = 原链接 + spectate=1（客户端深链约定）；已有的 spectate 不会被清掉以外的参数影响
+  assert.match(html, /class="btn btn--amber btn--sm" data-href="https:\/\/stronghold\.lunar\.ag\/\?spectate=1"/);
   assert.match(html, /class="btn btn--sm" disabled><span class="btn__label">满员<\/span><\/button>/);
 
   // Server names are shown verbatim (never hidden); difficulty uses the panel's label table.
@@ -178,9 +179,11 @@ test('page: renders joinable first, 观战 for in-match, disabled 满员, escape
   assert.ok(!html.includes('0/0 人'), 'capacity-less room must not render a 0/0 seat row');
   assert.match(html, /2\/4/, 'reported seats still render');
 
-  // Hostile URL falls back to the official web entry — never the loopback link.
-  assert.ok(!html.includes('127.0.0.1'), 'loopback URL must not survive');
-  assert.match(html, /data-href="https:\/\/weishu\.jiangjiangze\.icu\/\?room=DDDD"/);
+  // v8：不合格的链接（这里是 http + 环回）不再回落到别的服务器 —— 该行给禁用按钮 + 说明。
+  assert.ok(!html.includes('127.0.0.1'), 'loopback URL must not survive anywhere in the row');
+  assert.ok(!html.includes('weishu.jiangjiangze.icu'), 'v8 has no DEFAULT_CLIENT fallback at all');
+  assert.match(html, /<button class="btn btn--sm" disabled title="该房间上报时没有给可加入的 https 链接"><span class="btn__label">无链接<\/span><\/button>/,
+    'a URL-less / hostile-URL row renders a disabled 无链接 button, never a jump elsewhere');
 
   // Every row carries its data source tag（本站房间牌）— the board rows are all `board` here.
   assert.match(html, /title="房间来源：本站房间牌（玩家上报）">本站</);
